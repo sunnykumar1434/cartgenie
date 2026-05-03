@@ -1,0 +1,26 @@
+{
+  "name": "cartgenie",
+  "version": "1.0.0",
+  "description": "CartGenie AI - Multi-Agent Customer Support System",
+  "main": "server.js",
+  "scripts": {
+  "start": "node app.js",
+  "dev": "node app.js",
+  "test:pipeline": "node testPipeline.js",
+  "test:intent": "node testIntent.js",
+  "test:rule": "node testRule.js"
+},
+  "keywords": [],
+  "author": "Sunny Kumar",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "groq-sdk": "^1.1.2"
+  }
+}

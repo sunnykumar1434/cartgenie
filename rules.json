@@ -1,0 +1,464 @@
+{
+  "version": "1.0.1",
+  "systemName": "CartGenie",
+  "architecture": "Trust-Layered Multi-Agent Customer Support Architecture",
+  "platformType": "generic_indian_ecommerce",
+  "policySources": [
+    "Flipkart",
+    "Myntra",
+    "Meesho"
+  ],
+  "description": "Generic Indian e-commerce policy rules for CartGenie multi-agent customer support system. LLM agents understand the query, but policy decisions must be made by ruleEngine.js using this rules.json and order data.",
+
+  "thresholds": {
+    "highConfidence": 0.75,
+    "lowConfidence": 0.5,
+    "highValueOrder": 50000,
+    "veryHighValueOrder": 200000,
+    "maxRepeatedFailures": 2
+  },
+
+  "supportedIntents": [
+    "cancel_order",
+    "return_order",
+    "replace_order",
+    "refund_status",
+    "exchange_order",
+    "track_order",
+    "delivery_issue",
+    "payment_issue",
+    "missing_item",
+    "wrong_item",
+    "damaged_item",
+    "general_support"
+  ],
+
+  "statuses": {
+    "cancellable": [
+      "placed",
+      "confirmed",
+      "processing"
+    ],
+    "nonCancellable": [
+      "dispatched",
+      "shipped",
+      "out_for_delivery",
+      "delivered",
+      "cancelled",
+      "return_picked",
+      "return_received",
+      "quality_check_passed",
+      "quality_check_failed",
+      "refund_initiated",
+      "refund_completed"
+    ],
+    "returnable": [
+      "delivered"
+    ],
+    "trackable": [
+      "dispatched",
+      "shipped",
+      "out_for_delivery"
+    ],
+    "refundProcessStatuses": [
+      "cancelled",
+      "return_picked",
+      "return_received",
+      "quality_check_passed",
+      "refund_initiated",
+      "refund_completed"
+    ],
+    "failedDeliveryStatuses": [
+      "delivery_failed",
+      "returned_to_origin",
+      "lost_in_transit"
+    ]
+  },
+
+  "cancellation": {
+    "description": "Cancellation is allowed only before dispatch/shipment. Once dispatched, shipped, out for delivery, or delivered, cancellation is blocked.",
+    "allowedStatuses": [
+      "placed",
+      "confirmed",
+      "processing"
+    ],
+    "blockedStatuses": [
+      "dispatched",
+      "shipped",
+      "out_for_delivery",
+      "delivered",
+      "cancelled",
+      "return_picked",
+      "return_received",
+      "quality_check_passed",
+      "quality_check_failed",
+      "refund_initiated",
+      "refund_completed"
+    ],
+    "refundRules": {
+      "prepaidCancellationRefund": true,
+      "refundToOriginalPaymentSource": true,
+      "codRefundRequired": false,
+      "sellerCancellationFullRefund": true,
+      "platformCancellationFullRefund": true,
+      "offerReversalOnCancellation": true
+    },
+    "decisionCodes": {
+      "allowed": "cancel_allowed",
+      "allowedWithRefund": "cancel_allowed_refund_initiated",
+      "blockedDispatched": "cancel_blocked_dispatched",
+      "blockedShipped": "cancel_blocked_shipped",
+      "blockedOutForDelivery": "cancel_blocked_out_for_delivery",
+      "blockedDelivered": "cancel_blocked_delivered",
+      "alreadyCancelled": "cancel_already_done",
+      "blockedAfterReturnStarted": "cancel_blocked_return_process_started",
+      "requiresEscalation": "cancel_requires_escalation"
+    }
+  },
+
+  "return": {
+    "description": "Return is allowed only if the product is returnable, request is inside the return window, product is not in a blocked category, and pickup/quality conditions are satisfied.",
+    "defaultReturnWindowDays": 7,
+    "categoryReturnWindows": {
+      "fashion": 10,
+      "home": 7,
+      "furniture": 10,
+      "electronics": 7,
+      "smartphone": 0,
+      "large_appliance": 10,
+      "grocery_perishable": 2,
+      "grocery_regular": 7,
+      "books": 7,
+      "sports": 7,
+      "medicine": 2,
+      "refurbished": 7,
+      "personal_care": 0,
+      "hygiene": 0,
+      "innerwear": 0,
+      "altered_product": 0
+    },
+    "blockedCategories": [
+      "innerwear",
+      "personal_care",
+      "hygiene",
+      "perishable",
+      "intimate_wear",
+      "sanitary_product",
+      "medicine_prescription",
+      "altered_product"
+    ],
+    "returnOnlyForIssueCategories": {
+      "non_returnable_exception_issues": [
+        "damaged_product",
+        "wrong_product",
+        "missing_item",
+        "incomplete_product",
+        "expired_product"
+      ]
+    },
+    "qualityCheckRequired": true,
+    "requiredConditions": [
+      "correct_product",
+      "complete_product",
+      "unused_product",
+      "undamaged_product",
+      "original_packaging",
+      "tags_intact",
+      "accessories_present"
+    ],
+    "deviceReturnConditions": [
+      "device_formatted",
+      "screen_lock_removed",
+      "icloud_removed_if_apple"
+    ],
+    "decisionCodes": {
+      "allowed": "return_allowed",
+      "blockedNotDelivered": "return_blocked_not_delivered",
+      "blockedWindowExpired": "return_blocked_window_expired",
+      "blockedNonReturnable": "return_blocked_non_returnable",
+      "qualityCheckRequired": "return_quality_check_required",
+      "blockedQualityCheckFailed": "return_blocked_quality_check_failed",
+      "blockedMissingAccessories": "return_blocked_missing_accessories",
+      "blockedWrongProduct": "return_blocked_wrong_product",
+      "blockedAlteredProduct": "return_blocked_altered_product",
+      "requiresEscalation": "return_requires_escalation"
+    }
+  },
+
+  "replacement": {
+    "description": "Replacement is allowed for defective, damaged, wrong, missing, incomplete, technical issue, or dead-on-arrival cases within the allowed replacement window. Sensitive categories such as smartphones, electronics, and large appliances may require brand verification, DOA certificate, or unboxing proof.",
+    "defaultReplacementWindowDays": 7,
+    "categoryReplacementWindows": {
+      "fashion": 10,
+      "home": 7,
+      "furniture": 10,
+      "electronics": 7,
+      "smartphone": 7,
+      "large_appliance": 10,
+      "books": 7,
+      "sports": 7,
+      "toys": 7,
+      "stationery": 7,
+      "refurbished": 7
+    },
+    "allowedIssueTypes": [
+      "defective_product",
+      "damaged_product",
+      "wrong_product",
+      "missing_item",
+      "incomplete_product",
+      "technical_issue",
+      "dead_on_arrival"
+    ],
+    "replacementOnlyCategories": [
+      "smartphone",
+      "electronics",
+      "large_appliance",
+      "refurbished",
+      "books",
+      "sports",
+      "toys",
+      "stationery"
+    ],
+    "brandVerificationCategories": [
+      "smartphone",
+      "electronics",
+      "large_appliance"
+    ],
+    "requiresUnboxingProofFor": [
+      "smartphone_damage",
+      "electronics_damage",
+      "large_appliance_damage",
+      "wrong_product",
+      "missing_item",
+      "damaged_product",
+      "dead_on_arrival"
+    ],
+    "requiresDOACertificateFor": [
+      "smartphone",
+      "electronics"
+    ],
+    "onlyOneReplacementAllowed": true,
+    "decisionCodes": {
+      "allowed": "replacement_allowed",
+      "replacementOnly": "replacement_only",
+      "requiresBrandVerification": "replacement_requires_brand_verification",
+      "requiresUnboxingProof": "replacement_requires_unboxing_proof",
+      "requiresDOACertificate": "replacement_requires_doa_certificate",
+      "blockedWindowExpired": "replacement_blocked_window_expired",
+      "blockedAlreadyReplaced": "replacement_blocked_already_replaced",
+      "blockedIssueNotEligible": "replacement_blocked_issue_not_eligible",
+      "requiresEscalation": "replacement_requires_escalation"
+    }
+  },
+
+  "refund": {
+    "description": "Refund is processed after successful cancellation or after returned product is picked up, received, and verified. Refund usually goes to the original payment source. COD refunds may require bank details.",
+    "refundAfterCancellation": true,
+    "refundAfterReturnReceived": true,
+    "refundAfterQualityCheck": true,
+    "refundToOriginalPaymentSource": true,
+    "codRequiresBankDetails": true,
+    "offerReversalOnCancellation": true,
+    "standardTimelineBusinessDays": "3-7",
+    "walletTimelineBusinessDays": "0-2",
+    "cardRefundTimelineBusinessDays": "7-10",
+    "decisionCodes": {
+      "initiated": "refund_initiated",
+      "completed": "refund_completed",
+      "pendingPickup": "refund_pending_return_pickup",
+      "pendingReturnReceived": "refund_pending_return_received",
+      "pendingQualityCheck": "refund_pending_quality_check",
+      "pendingBankDetails": "refund_pending_bank_details",
+      "originalPaymentSource": "refund_original_payment_source",
+      "blockedPolicyViolation": "refund_blocked_policy_violation",
+      "discrepancyEscalate": "refund_discrepancy_escalate"
+    }
+  },
+
+  "exchange": {
+    "description": "Exchange is allowed only when product is exchangeable, stock is available, address is serviceable, request is within exchange window, and quality check passes.",
+    "defaultExchangeWindowDays": 7,
+    "categoryExchangeWindows": {
+      "fashion": 10,
+      "home": 7,
+      "furniture": 10,
+      "electronics": 0,
+      "smartphone": 0,
+      "large_appliance": 0,
+      "books": 0,
+      "sports": 0,
+      "grocery_regular": 0,
+      "grocery_perishable": 0
+    },
+    "stockRequired": true,
+    "serviceableAddressRequired": true,
+    "qualityCheckRequired": true,
+    "onlyOneExchangeAllowed": true,
+    "notAllowedReasons": [
+      "customer_not_interested",
+      "quality_expectation_issue",
+      "fraud_risk",
+      "wrong_product_returned"
+    ],
+    "decisionCodes": {
+      "allowed": "exchange_allowed",
+      "blockedNotExchangeable": "exchange_blocked_not_exchangeable",
+      "blockedStockUnavailable": "exchange_blocked_stock_unavailable",
+      "blockedAddressNotServiceable": "exchange_blocked_address_not_serviceable",
+      "blockedWindowExpired": "exchange_blocked_window_expired",
+      "convertedToReturn": "exchange_converted_to_return",
+      "blockedAlreadyExchanged": "exchange_blocked_already_exchanged",
+      "blockedReasonNotEligible": "exchange_blocked_reason_not_eligible"
+    }
+  },
+
+  "payment": {
+    "description": "Payment failure, double payment, refund mismatch, unsupported refund bank, COD limitation, high-value payment, and suspicious transaction cases should be verified or escalated.",
+    "codMaxOrderValue": 50000,
+    "panRequiredAbove": 200000,
+    "supportedMethods": [
+      "upi",
+      "card",
+      "netbanking",
+      "wallet",
+      "cod",
+      "pay_later",
+      "emi"
+    ],
+    "paymentConflictStatuses": [
+      "failed",
+      "double_charged",
+      "refund_failed",
+      "refund_not_received",
+      "payment_pending_but_debited"
+    ],
+    "escalatePaymentConflicts": true,
+    "escalateRefundDisputes": true,
+    "requiresVerificationForHighValue": true,
+    "decisionCodes": {
+      "paymentIssueEscalate": "payment_issue_escalate",
+      "refundDisputeEscalate": "refund_dispute_escalate",
+      "bankDetailsRequired": "bank_details_required",
+      "transactionUnderVerification": "transaction_under_verification",
+      "codNotAvailable": "cod_not_available",
+      "panVerificationRequired": "pan_verification_required",
+      "paymentMethodSupported": "payment_method_supported"
+    }
+  },
+
+  "delivery": {
+    "description": "Tracking is available after dispatch/shipping. Delivery delay, failed delivery, address not serviceable, returned to origin, or lost shipment may require escalation.",
+    "trackingStatuses": [
+      "dispatched",
+      "shipped",
+      "out_for_delivery"
+    ],
+    "failedDeliveryStatuses": [
+      "delivery_failed",
+      "returned_to_origin",
+      "lost_in_transit"
+    ],
+    "decisionCodes": {
+      "trackingAvailable": "tracking_available",
+      "trackingNotAvailable": "tracking_not_available",
+      "deliveryDelayInfo": "delivery_delay_info",
+      "deliveryFailedEscalate": "delivery_failed_escalate",
+      "addressNotServiceable": "address_not_serviceable",
+      "lostInTransitEscalate": "lost_in_transit_escalate",
+      "returnedToOrigin": "returned_to_origin"
+    }
+  },
+
+  "guardrails": {
+    "description": "These are used by the Input Guardrail Agent before normal intent processing.",
+    "invalidQueryPatterns": [
+      "empty_query",
+      "only_symbols",
+      "too_short",
+      "random_gibberish"
+    ],
+    "promptInjectionPatterns": [
+      "ignore previous instructions",
+      "bypass rules",
+      "forget policy",
+      "act as admin",
+      "approve my refund without checking"
+    ],
+    "abusiveSignals": [
+      "abuse",
+      "threat",
+      "extreme_anger"
+    ],
+    "decisionCodes": {
+      "invalidQuery": "invalid_query",
+      "promptInjectionDetected": "prompt_injection_detected",
+      "abusiveCustomer": "abusive_customer_detected",
+      "safeInput": "safe_input"
+    }
+  },
+
+  "escalation": {
+    "description": "Risky, unclear, angry, payment-sensitive, high-value, fraud-risk, or policy-conflict cases must be escalated to human support.",
+    "triggers": [
+      "angry_customer",
+      "abusive_customer",
+      "high_value_order",
+      "very_high_value_order",
+      "payment_conflict",
+      "refund_dispute",
+      "policy_conflict",
+      "fraud_risk",
+      "missing_product_claim",
+      "wrong_product_claim",
+      "smartphone_doa_claim",
+      "brand_verification_required",
+      "unboxing_proof_required",
+      "repeated_low_confidence",
+      "order_status_unclear",
+      "pan_verification_required"
+    ],
+    "priorityMap": {
+      "very_high_value_order": "CRITICAL",
+      "pan_verification_required": "CRITICAL",
+      "payment_conflict": "HIGH",
+      "refund_dispute": "HIGH",
+      "angry_customer": "HIGH",
+      "abusive_customer": "HIGH",
+      "fraud_risk": "HIGH",
+      "smartphone_doa_claim": "HIGH",
+      "missing_product_claim": "MEDIUM",
+      "wrong_product_claim": "MEDIUM",
+      "policy_conflict": "MEDIUM",
+      "brand_verification_required": "MEDIUM",
+      "unboxing_proof_required": "MEDIUM",
+      "repeated_low_confidence": "MEDIUM",
+      "order_status_unclear": "MEDIUM"
+    },
+    "decisionCodes": {
+      "criticalPriority": "escalate_critical_priority",
+      "highPriority": "escalate_high_priority",
+      "paymentConflict": "escalate_payment_conflict",
+      "policyConflict": "escalate_policy_conflict",
+      "fraudRisk": "escalate_fraud_risk",
+      "verificationRequired": "escalate_verification_required",
+      "humanReview": "escalate_human_review"
+    }
+  },
+
+  "responseTone": {
+    "default": "polite_clear_professional",
+    "angryCustomer": "empathetic_and_escalation_ready",
+    "blockedPolicy": "clear_reason_with_next_step",
+    "allowedAction": "positive_confirmation_with_next_step"
+  },
+
+  "commonErrors": {
+    "missingOrderId": "missing_order_id",
+    "orderNotFound": "order_not_found",
+    "unsupportedIntent": "unsupported_intent",
+    "lowConfidence": "low_confidence",
+    "invalidQuery": "invalid_query",
+    "policyNotFound": "policy_not_found"
+  }
+}
