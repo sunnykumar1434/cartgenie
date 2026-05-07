@@ -30,11 +30,10 @@ const PORT = process.env.PORT || 5001;
 // =====================================================
 // SESSION STORE
 // Tracks repeated fallback/clarification failures.
-// In production, this should move to Redis/MongoDB.
+// In production, move this to Redis/MongoDB.
 // =====================================================
 
 const sessionStore = {};
-
 const REPEATED_FAILURE_LIMIT = 3;
 
 function getSession(sessionId = "default_session") {
@@ -140,8 +139,10 @@ function buildRepeatedFailureEscalation(
     response: {
       success: true,
       status: "ESCALATION_REQUIRED",
+      message:
+        "I’m sorry this hasn’t been resolved yet. I’m moving this to a support specialist so your concern can be reviewed properly. If this is related to an order, please keep your order ID ready.",
       customerMessage:
-        "I’m escalating this to a support specialist so we can help you better. Please keep your order ID ready if your issue is related to an order.",
+        "I’m sorry this hasn’t been resolved yet. I’m moving this to a support specialist so your concern can be reviewed properly. If this is related to an order, please keep your order ID ready.",
       internal: {
         reason: "Repeated fallback or clarification failure.",
         failureLimit: REPEATED_FAILURE_LIMIT,
@@ -191,7 +192,30 @@ app.use(express.json());
 
 function findOrder(orderId) {
   if (!orderId) return null;
-  return orders.find((order) => order.orderId === orderId) || null;
+
+  const normalizedOrderId = String(orderId).trim().toUpperCase();
+
+  return (
+    orders.find(
+      (order) => String(order.orderId).trim().toUpperCase() === normalizedOrderId
+    ) || null
+  );
+}
+
+function getIntentFriendlyName(intent) {
+  const intentMap = {
+    cancel_order: "cancellation",
+    return_order: "return",
+    replace_order: "replacement",
+    exchange_order: "exchange",
+    refund_status: "refund",
+    payment_issue: "payment",
+    track_order: "delivery or tracking",
+    wrong_item: "wrong item",
+    missing_item: "missing item"
+  };
+
+  return intentMap[intent] || "order-related";
 }
 
 function buildClarificationResponse(
@@ -201,14 +225,17 @@ function buildClarificationResponse(
 ) {
   const missing = confidenceResult.missingEntities || [];
   const attempt = sessionState?.totalFailureCount || 0;
+  const friendlyIntent = getIntentFriendlyName(intentResult?.intent);
 
   if (missing.includes("orderId")) {
     if (attempt >= 2) {
       return {
         success: true,
         status: "CLARIFICATION_REQUIRED",
+        message:
+          "I can help you with this, but I still need your order ID to check the correct details. Please share it in a format like ORD101. You can ask about cancellation, return, refund, replacement, exchange, delivery, tracking, or payment issues.",
         customerMessage:
-          "Please share your order ID, for example ORD101. I can help with cancellation, return, refund, replacement, exchange, delivery, or payment issues.",
+          "I can help you with this, but I still need your order ID to check the correct details. Please share it in a format like ORD101. You can ask about cancellation, return, refund, replacement, exchange, delivery, tracking, or payment issues.",
         internal: {
           route: confidenceResult.route,
           decision: confidenceResult.decision,
@@ -223,8 +250,8 @@ function buildClarificationResponse(
     return {
       success: true,
       status: "CLARIFICATION_REQUIRED",
-      customerMessage:
-        "Please share your order ID so I can check this request properly.",
+      message: `Sure, I can help you with the ${friendlyIntent} request. Please share your order ID so I can check the latest status and guide you with the correct next step.`,
+      customerMessage: `Sure, I can help you with the ${friendlyIntent} request. Please share your order ID so I can check the latest status and guide you with the correct next step.`,
       internal: {
         route: confidenceResult.route,
         decision: confidenceResult.decision,
@@ -240,8 +267,10 @@ function buildClarificationResponse(
     return {
       success: true,
       status: "CLARIFICATION_REQUIRED",
+      message:
+        "I want to make sure I guide you correctly. Please share a little more detail about the issue. For example, you can say: cancel ORD101, return ORD103, track ORD102, refund status ORD106, or replace damaged product ORD105.",
       customerMessage:
-        "I need a little more detail. You can ask things like: cancel ORD101, return ORD103, track ORD102, refund status ORD106, or replace damaged product ORD105.",
+        "I want to make sure I guide you correctly. Please share a little more detail about the issue. For example, you can say: cancel ORD101, return ORD103, track ORD102, refund status ORD106, or replace damaged product ORD105.",
       internal: {
         route: confidenceResult.route,
         decision: confidenceResult.decision,
@@ -256,8 +285,10 @@ function buildClarificationResponse(
   return {
     success: true,
     status: "CLARIFICATION_REQUIRED",
+    message:
+      "I want to help, but I need a little more detail to understand your request correctly. Please tell me what happened and share your order ID if this is related to an order.",
     customerMessage:
-      "I need a little more detail to understand your request correctly.",
+      "I want to help, but I need a little more detail to understand your request correctly. Please tell me what happened and share your order ID if this is related to an order.",
     internal: {
       route: confidenceResult.route,
       decision: confidenceResult.decision,
@@ -476,7 +507,8 @@ app.get("/api/orders/:orderId", (req, res) => {
   if (!order) {
     return res.status(404).json({
       success: false,
-      message: "Order not found.",
+      message:
+        "I couldn’t find this order in the demo records. Please check the order ID and try again.",
       orderId
     });
   }
@@ -555,7 +587,10 @@ app.post("/api/support", async (req, res) => {
       return res.status(400).json({
         success: false,
         status: "INVALID_REQUEST",
-        message: "Query is required.",
+        message:
+          "Please enter your support request so I can help you. For example, you can say: Cancel my order ORD101.",
+        customerMessage:
+          "Please enter your support request so I can help you. For example, you can say: Cancel my order ORD101.",
         example: {
           sessionId: "user_123",
           query: "Cancel my order ORD101"
@@ -594,7 +629,10 @@ app.post("/api/support", async (req, res) => {
     return res.status(500).json({
       success: false,
       status: "SERVER_ERROR",
-      message: "Something went wrong while processing your request.",
+      message:
+        "Sorry, something went wrong while processing your request. Please try again in a moment.",
+      customerMessage:
+        "Sorry, something went wrong while processing your request. Please try again in a moment.",
       error: process.env.NODE_ENV === "production" ? undefined : error.message
     });
   }
