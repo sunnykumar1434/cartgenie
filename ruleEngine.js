@@ -146,6 +146,8 @@ function shouldApplyValueEscalation(intent, decision) {
     "replacement_policy_info",
     "cancellation_policy_info",
     "refund_not_started",
+    "refund_completed",
+    "refund_initiated",
   ];
 
   if (intent === "track_order" && informationalDecisions.includes(decision)) {
@@ -242,7 +244,7 @@ function evaluatePolicyInfo(intent) {
       decision: "cancellation_policy_info",
       reason:
         policy.cancellation_policy?.message ||
-        "Cancellation is usually allowed before dispatch or shipment. Once shipped, out for delivery, or delivered, cancellation is blocked.",
+        "Cancellation is usually allowed before dispatch or shipment. Once shipped, out for delivery, or delivered, cancellation is no longer available automatically.",
       nextAction: "ask_order_id_for_cancellation_eligibility",
     },
   };
@@ -255,7 +257,8 @@ function evaluatePolicyInfo(intent) {
       order: null,
       decision: "policy_info_unavailable",
       allowed: false,
-      reason: "I can help with order policies, but I need a little more detail.",
+      reason:
+        "I can help with order policies, but I need a little more detail to guide you correctly.",
       nextAction: "ask_clarifying_question",
     });
   }
@@ -373,7 +376,7 @@ function evaluateCancellation(order) {
         decision: decisionCodes.blockedDispatched || "cancel_blocked_dispatched",
         allowed: false,
         reason:
-          "Order has already been dispatched, so cancellation is blocked as per policy.",
+          "Order has already been dispatched, so direct cancellation is not available at this stage.",
         nextAction: "suggest_reject_at_doorstep_or_return_if_eligible",
       }),
       order
@@ -388,7 +391,7 @@ function evaluateCancellation(order) {
         decision: decisionCodes.blockedShipped || "cancel_blocked_shipped",
         allowed: false,
         reason:
-          "Order has already been shipped, so cancellation is blocked as per policy.",
+          "Order has already been shipped, so direct cancellation is not available at this stage.",
         nextAction: "suggest_reject_at_doorstep_or_return_if_eligible",
       }),
       order
@@ -405,7 +408,7 @@ function evaluateCancellation(order) {
           "cancel_blocked_out_for_delivery",
         allowed: false,
         reason:
-          "Order is already out for delivery, so it cannot be cancelled now. Customer may reject it at doorstep if allowed.",
+          "Order is already out for delivery, so direct cancellation is not available now.",
         nextAction: "suggest_reject_at_doorstep",
       }),
       order
@@ -420,7 +423,7 @@ function evaluateCancellation(order) {
         decision: decisionCodes.blockedDelivered || "cancel_blocked_delivered",
         allowed: false,
         reason:
-          "Order has already been delivered, so cancellation is not possible. Customer may request return or replacement if eligible.",
+          "Order has already been delivered, so cancellation is not possible now. Return or replacement can be checked if the product is eligible.",
         nextAction: "suggest_return_or_replacement_if_eligible",
       }),
       order
@@ -445,7 +448,7 @@ function evaluateCancellation(order) {
       decision: decisionCodes.requiresEscalation || "cancel_requires_escalation",
       allowed: false,
       reason:
-        "Cancellation decision requires human review because the order status is not clear for automatic cancellation.",
+        "Cancellation needs manual review because the current order status is not clear enough for automatic cancellation.",
       requiresEscalation: true,
       escalationTriggers: ["order_status_unclear"],
       nextAction: "human_review",
@@ -503,7 +506,7 @@ function evaluateReturn(order) {
           decisionCodes.blockedNonReturnable || "return_blocked_non_returnable",
         allowed: false,
         reason:
-          "This product category is not eligible for normal return as per policy.",
+          "This product category is not eligible for normal return as per the current policy.",
         nextAction: "check_replacement_if_damaged_wrong_or_defective",
       }),
       order
@@ -540,7 +543,7 @@ function evaluateReturn(order) {
           decisionCodes.blockedQualityCheckFailed ||
           "return_blocked_quality_check_failed",
         allowed: false,
-        reason: "Return is blocked because quality check failed.",
+        reason: "Return needs manual review because quality check failed.",
         requiresEscalation: true,
         escalationTriggers: ["policy_conflict"],
         nextAction: "manual_quality_check_review",
@@ -552,23 +555,29 @@ function evaluateReturn(order) {
   const conditionFailures = [];
 
   if (order.correctProduct === false) conditionFailures.push("wrong_product");
-  if (order.completeProduct === false) conditionFailures.push("incomplete_product");
+  if (order.completeProduct === false)
+    conditionFailures.push("incomplete_product");
   if (order.unusedProduct === false) conditionFailures.push("used_product");
-  if (order.undamagedProduct === false) conditionFailures.push("damaged_product");
-  if (order.originalPackaging === false) conditionFailures.push("missing_packaging");
+  if (order.undamagedProduct === false)
+    conditionFailures.push("damaged_product");
+  if (order.originalPackaging === false)
+    conditionFailures.push("missing_packaging");
   if (order.tagsIntact === false) conditionFailures.push("tags_missing");
-  if (order.accessoriesPresent === false) conditionFailures.push("missing_accessories");
-  if (order.isAlteredProduct === true) conditionFailures.push("altered_product");
+  if (order.accessoriesPresent === false)
+    conditionFailures.push("missing_accessories");
+  if (order.isAlteredProduct === true)
+    conditionFailures.push("altered_product");
 
   if (conditionFailures.length > 0) {
     return applyCommonEscalation(
       createResult({
         intent: "return_order",
         order,
-        decision: decisionCodes.qualityCheckRequired || "return_quality_check_required",
+        decision:
+          decisionCodes.qualityCheckRequired || "return_quality_check_required",
         allowed: false,
         reason:
-          "Return requires manual quality-check review because some return conditions are not fully satisfied.",
+          "Return needs manual quality-check review because some return conditions are not fully satisfied.",
         requiresEscalation: true,
         escalationTriggers: ["policy_conflict"],
         nextAction: "manual_quality_check_review",
@@ -599,10 +608,21 @@ function evaluateReturn(order) {
 // REPLACEMENT / DAMAGED / WRONG / MISSING
 // ===============================
 
+function resolveReplacementIssueType(order = {}, inputIssueType = "general") {
+  const input = normalize(inputIssueType);
+  const orderIssue = normalize(order.issueType || "general");
+
+  if (!input || input === "general") {
+    return orderIssue || "general";
+  }
+
+  return input;
+}
+
 function evaluateReplacement(order, inputIssueType = "general") {
   const status = normalizeStatus(order.status);
   const category = normalize(order.category);
-  const issueType = normalize(inputIssueType || order.issueType || "general");
+  const issueType = resolveReplacementIssueType(order, inputIssueType);
   const decisionCodes = rules.replacement?.decisionCodes || {};
 
   const allowedIssueTypes = rules.replacement?.allowedIssueTypes || [
@@ -625,6 +645,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
         reason:
           "Replacement can be checked only after the order is delivered.",
         nextAction: "wait_until_delivery",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -640,8 +663,11 @@ function evaluateReplacement(order, inputIssueType = "general") {
           "replacement_blocked_issue_not_eligible",
         allowed: false,
         reason:
-          "This product is not eligible for replacement as per the current product policy.",
+          "This product is not eligible for automatic replacement under the current product policy.",
         nextAction: "human_review_if_customer_disputes",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -657,8 +683,11 @@ function evaluateReplacement(order, inputIssueType = "general") {
           "replacement_blocked_issue_not_eligible",
         allowed: false,
         reason:
-          "Based on the selected issue type, this product is not eligible for replacement as per policy.",
+          "Based on the selected issue type, this product is not eligible for automatic replacement as per policy.",
         nextAction: "ask_customer_for_issue_details",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -679,6 +708,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
         reason:
           "Only one replacement is allowed for this product, and a replacement has already been used.",
         nextAction: "human_review_if_customer_disputes",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -701,6 +733,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
         allowed: false,
         reason: `Replacement window has expired. This product had a replacement window of ${windowDays} days.`,
         nextAction: "brand_service_or_human_review",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -708,9 +743,7 @@ function evaluateReplacement(order, inputIssueType = "general") {
 
   const escalationTriggers = [];
 
-  if (
-    ["wrong_product", "missing_item"].includes(issueType)
-  ) {
+  if (["wrong_product", "missing_item"].includes(issueType)) {
     escalationTriggers.push(
       issueType === "wrong_product"
         ? "wrong_product_claim"
@@ -737,6 +770,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
         requiresEscalation: true,
         escalationTriggers,
         nextAction: "collect_doa_certificate_and_unboxing_video",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -761,6 +797,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
         requiresEscalation: true,
         escalationTriggers,
         nextAction: "collect_brand_verification_or_service_center_details",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -784,6 +823,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
         requiresEscalation: true,
         escalationTriggers,
         nextAction: "collect_unboxing_proof",
+        extra: {
+          issueType,
+        },
       }),
       order
     );
@@ -798,6 +840,9 @@ function evaluateReplacement(order, inputIssueType = "general") {
       reason:
         "Product is eligible for replacement. Pickup and verification may be required.",
       nextAction: "create_replacement_request",
+      extra: {
+        issueType,
+      },
     }),
     order
   );
@@ -821,7 +866,7 @@ function evaluateRefund(order) {
           decisionCodes.discrepancyEscalate || "refund_discrepancy_escalate",
         allowed: false,
         reason:
-          "Refund/payment discrepancy detected. This needs human support verification.",
+          "Refund or payment discrepancy detected. This needs human support verification.",
         requiresEscalation: true,
         escalationTriggers: ["refund_dispute", "payment_conflict"],
         nextAction: "create_payment_support_ticket",
@@ -895,7 +940,7 @@ function evaluateRefund(order) {
         decision: "refund_not_started",
         allowed: false,
         reason:
-          "No active refund is found for this order yet. Refund can start after a successful cancellation or after an approved return is picked up, received, and verified.",
+          "No active refund is found for this order yet. Refund can start after successful cancellation or after an approved return is picked up, received, and verified.",
         refundRequired: false,
         nextAction:
           status === "delivered"
@@ -1125,7 +1170,8 @@ function evaluateExchange(order) {
           decisionCodes.blockedAddressNotServiceable ||
           "exchange_blocked_address_not_serviceable",
         allowed: false,
-        reason: "Exchange pickup or delivery is not serviceable at this address.",
+        reason:
+          "Exchange pickup or delivery is not serviceable at this address.",
         nextAction: "human_review_or_alternate_address",
       }),
       order
@@ -1453,7 +1499,7 @@ function applyRules(input, maybeOrder = null, maybeIssueType = "general") {
       return evaluateReturn(order);
 
     case "replace_order":
-      return evaluateReplacement(order, issueType || order.issueType || "general");
+      return evaluateReplacement(order, issueType);
 
     case "damaged_item":
       return evaluateReplacement(order, "damaged_product");
@@ -1484,7 +1530,8 @@ function applyRules(input, maybeOrder = null, maybeIssueType = "general") {
         order,
         decision: rules.commonErrors?.unsupportedIntent || "unsupported_intent",
         allowed: false,
-        reason: "This support intent is not supported by the current rule engine.",
+        reason:
+          "This support intent is not supported by the current rule engine.",
         nextAction: "fallback_llm_or_human_review",
       });
   }
@@ -1514,6 +1561,7 @@ module.exports = {
     evaluateHumanSupport,
     evaluateCancellation,
     evaluateReturn,
+    resolveReplacementIssueType,
     evaluateReplacement,
     evaluateRefund,
     evaluatePayment,

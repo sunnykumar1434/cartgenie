@@ -1,513 +1,400 @@
 // fallbackAgent.js
-
-const REPEATED_FAILURE_LIMIT = 3;
-
-// ===============================
-// BASIC HELPERS
-// ===============================
-
-function getAttempt(sessionState = {}) {
-  return sessionState.totalFailureCount || 0;
-}
+// Handles greeting, conversation end, general support, policy FAQs,
+// unclear queries, unsafe requests, and polite redirection when the request
+// should not go to the rule engine.
 
 function normalizeText(text = "") {
-  return String(text).trim().toLowerCase();
+  return String(text || "").trim().toLowerCase();
 }
 
-function safeInternal(confidenceResult, intentResult, sessionState, extra = {}) {
-  return {
-    route: confidenceResult?.route || "fallback_llm",
-    decision: confidenceResult?.decision || "fallback_required",
-    intent: intentResult?.intent || "general_support",
-    confidence: intentResult?.confidence ?? 0,
-    riskSignals: confidenceResult?.riskSignals || [],
-    attempt: getAttempt(sessionState),
-    ...extra,
-  };
+function includesAny(text = "", patterns = []) {
+  const cleanText = normalizeText(text);
+  return patterns.some((pattern) => cleanText.includes(pattern));
 }
 
-// ===============================
-// QUERY CLASSIFIERS
-// ===============================
+function isGreetingQuery(query = "") {
+  const cleanText = normalizeText(query);
 
-function isGreetingQuery(text = "") {
-  const clean = normalizeText(text);
-
-  return /^(hi|hello|hey|hii|hiii|good morning|good afternoon|good evening|namaste|namaskar)$/i.test(
-    clean
+  return /^(hi|hii|hiii|hello|helo|helloo|hey|heyy|he|hy|good morning|good afternoon|good evening|namaste|namaskar)$/i.test(
+    cleanText
   );
 }
 
-function isEntertainmentOrCreativeQuery(text = "") {
-  const clean = normalizeText(text);
+function isConversationEndQuery(query = "") {
+  const cleanText = normalizeText(query);
 
-  const patterns = [
-    "joke",
-    "funny",
-    "make me laugh",
-    "shayari",
-    "poem",
-    "poetry",
-    "story",
-    "sing",
-    "song",
-    "rap",
-    "riddle",
-    "meme",
-    "quote",
-    "pickup line",
-  ];
-
-  return patterns.some((pattern) => clean.includes(pattern));
+  return [
+    "thanks",
+    "thank you",
+    "thankyou",
+    "thanks a lot",
+    "thank you so much",
+    "okay thanks",
+    "ok thanks",
+    "ok thank you",
+    "okay thank you",
+    "done",
+    "okay done",
+    "ok done",
+    "got it",
+    "understood",
+    "fine",
+    "cool",
+    "great",
+    "nice",
+    "perfect",
+    "that helps",
+    "helpful",
+  ].includes(cleanText);
 }
 
-function isKnowledgeOrStudyQuery(text = "") {
-  const clean = normalizeText(text);
+function getIntentFriendlyName(intent = "") {
+  const map = {
+    greeting: "greeting",
+    conversation_end: "conversation end",
+    general_support: "order support",
+    non_commerce_request: "general query",
+    unsafe_request: "safety-sensitive request",
 
-  const patterns = [
-    "what is",
-    "who is",
-    "where is",
-    "when is",
-    "explain",
-    "definition",
-    "meaning of",
-    "tell me about",
-    "history of",
-    "difference between",
-    "write code",
-    "python",
-    "java",
-    "javascript",
-    "c++",
-    "html",
-    "css",
-    "sql",
-    "homework",
-    "assignment",
-    "resume",
-    "cover letter",
-    "interview question",
-  ];
+    cancel_order: "cancellation",
+    return_order: "return",
+    replace_order: "replacement",
+    refund_status: "refund",
+    refund_policy: "refund",
+    exchange_order: "exchange",
+    track_order: "tracking",
+    delivery_issue: "delivery",
+    delivery_policy: "delivery",
+    payment_issue: "payment",
+    missing_item: "missing item",
+    wrong_item: "wrong item",
+    damaged_item: "damaged item",
 
-  return patterns.some((pattern) => clean.includes(pattern));
+    return_policy: "return policy",
+    replacement_policy: "replacement policy",
+    cancellation_policy: "cancellation policy",
+    human_support: "human support",
+    order_reference_only: "order reference",
+  };
+
+  return map[intent] || "order support";
 }
 
-function isLifestyleOrExternalQuery(text = "") {
-  const clean = normalizeText(text);
-
-  const patterns = [
-    "weather",
-    "news",
-    "cricket",
-    "score",
-    "movie",
-    "recipe",
-    "travel",
-    "flight",
-    "train",
-    "book ticket",
-    "hotel",
-    "restaurant",
-  ];
-
-  return patterns.some((pattern) => clean.includes(pattern));
+function getOrderIdText(orderId) {
+  return orderId ? ` for order ${orderId}` : "";
 }
 
-function isGarbageLikeQuery(text = "") {
-  const clean = normalizeText(text);
-
-  if (!clean) return true;
-  if (clean.length <= 2) return true;
-  if (/^[^a-z0-9]+$/i.test(clean)) return true;
-
-  const patterns = [
-    "asdasd",
-    "asdf",
-    "qwerty",
-    "blah",
-    "random",
-    "test test",
-    "aaaa",
-    "????",
-    "sdf",
-    "xyzxyz",
-    "lorem ipsum",
-    "dummy text",
-    "gibberish",
-  ];
-
-  return patterns.some((pattern) => clean.includes(pattern));
-}
-
-function isOrderSupportRelated(text = "") {
-  const clean = normalizeText(text);
-
-  const patterns = [
-    "order",
-    "ord",
-    "cancel",
-    "return",
-    "refund",
-    "replace",
-    "replacement",
-    "exchange",
-    "delivery",
-    "track",
-    "tracking",
-    "payment",
-    "cod",
-    "upi",
-    "card",
-    "paid",
-    "delivered",
-    "shipped",
-    "dispatch",
-    "item",
-    "product",
-    "missing",
-    "wrong",
-    "damaged",
-    "defective",
-    "invoice",
-    "pickup",
-    "courier",
-    "shipment",
-  ];
-
-  return patterns.some((pattern) => clean.includes(pattern));
-}
-
-function getNonCommerceCategory(text = "") {
-  if (isGreetingQuery(text)) return "greeting";
-  if (isEntertainmentOrCreativeQuery(text)) return "creative_or_entertainment";
-  if (isKnowledgeOrStudyQuery(text)) return "knowledge_or_study";
-  if (isLifestyleOrExternalQuery(text)) return "external_or_lifestyle";
-  if (isGarbageLikeQuery(text)) return "unclear_or_garbage";
-  return "off_topic_general";
-}
-
-// ===============================
-// RESPONSE BUILDERS
-// ===============================
-
-function makeResponse(status, message, confidenceResult, intentResult, sessionState, extraInternal = {}) {
+function buildResponse(status, customerMessage, internal = {}) {
   return {
     success: true,
     status,
-    message,
-    customerMessage: message,
-    internal: safeInternal(confidenceResult, intentResult, sessionState, extraInternal),
-  };
-}
-
-function buildGreetingResponse(confidenceResult, intentResult, sessionState) {
-  const message =
-    "Hi, welcome to CartGenie AI. I can help you with order tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Tell me what you need help with, and share your order ID if you have it.";
-
-  return makeResponse(
-    "GREETING",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      decision: "greeting_detected",
-      fallbackType: "greeting",
-    }
-  );
-}
-
-function buildUnsafeInputResponse(confidenceResult, intentResult, sessionState) {
-  const message =
-    "I can help you with order-related support, but I cannot bypass policy checks, skip verification, hide logs, or ignore safety rules. Please share your actual order issue and order ID, and I will guide you through the correct support flow.";
-
-  return makeResponse(
-    "FALLBACK_REQUIRED",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      fallbackType: "unsafe_input",
-    }
-  );
-}
-
-function buildHumanSupportFallback(confidenceResult, intentResult, sessionState) {
-  const message =
-    "I understand that you would like human support. I can mark this for review by the support team. To help them check faster, please share your order ID and a short description of the issue.";
-
-  return makeResponse(
-    "ESCALATION_REQUESTED",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      fallbackType: "human_support_requested",
-    }
-  );
-}
-
-function buildGeneralPolicyFallback(confidenceResult, intentResult, sessionState) {
-  const intent = intentResult?.intent || confidenceResult?.intent;
-
-  const policyMessages = {
-    delivery_policy:
-      "Delivery timelines usually depend on the product, seller, warehouse location, courier availability, and your delivery address. Share your order ID and I can check the current order status for you.",
-    refund_policy:
-      "Refund timelines usually depend on the payment method and whether pickup, return, or quality check is completed. Share your order ID and I can check the exact refund status for you.",
-    return_policy:
-      "Return eligibility depends on the product category, return window, delivery status, item condition, and quality check rules. Share your order ID and I can check whether your order is eligible.",
-    replacement_policy:
-      "Replacement eligibility depends on the product category, issue type, stock availability, replacement window, and verification requirements. Share your order ID and I can check it properly.",
-    cancellation_policy:
-      "Cancellation usually depends on whether the order is still placed/confirmed or already shipped/out for delivery. Share your order ID and I can check if cancellation is available.",
-  };
-
-  const message =
-    policyMessages[intent] ||
-    "I can help with policy-related order questions. Please share your order ID if you want me to check the exact eligibility or status.";
-
-  return makeResponse(
-    "POLICY_INFO",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      fallbackType: "general_policy_query",
-    }
-  );
-}
-
-function buildUnsupportedIntentResponse(confidenceResult, intentResult, sessionState) {
-  const attempt = getAttempt(sessionState);
-
-  const message =
-    attempt >= REPEATED_FAILURE_LIMIT
-      ? "I am sorry, I am still not able to complete this request automatically. I am designed for order-related support like tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. If your concern is related to an order, please share the order ID and I will check it properly."
-      : "I understand what you are asking, but I am focused on e-commerce order support right now. I can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Please share your order concern and I will guide you step by step.";
-
-  return makeResponse(
-    "FALLBACK_REQUIRED",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      fallbackType:
-        attempt >= REPEATED_FAILURE_LIMIT
-          ? "unsupported_intent_repeated"
-          : "unsupported_intent",
-    }
-  );
-}
-
-function buildNonCommerceResponse(confidenceResult, intentResult, sessionState) {
-  const attempt = getAttempt(sessionState);
-  const rawText = intentResult?.rawText || "";
-  const category = getNonCommerceCategory(rawText);
-
-  let message;
-
-  if (category === "creative_or_entertainment") {
-    message =
-      "That sounds fun, but I am here mainly to help with your order-related concerns. I can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Share your order ID or tell me your order problem, and I will help right away.";
-  } else if (category === "knowledge_or_study") {
-    message =
-      "I may not be the right assistant for that topic because I am focused on CartGenie order support. I can help you with order tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Please share your order concern and I will guide you.";
-  } else if (category === "external_or_lifestyle") {
-    message =
-      "I cannot help much with that outside topic here, but I can definitely help with your order support needs. You can ask me about tracking, cancellation, returns, refunds, replacement, exchange, delivery, or payment issues.";
-  } else if (category === "unclear_or_garbage") {
-    message =
-      "I could not understand that clearly. Please tell me your order-related issue in a simple way, such as track my order, cancel my order, return my product, refund not received, or replace damaged product. If you have an order ID, include it too.";
-  } else {
-    message =
-      "I am here mainly for order-related support. I can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Please share your order concern and I will guide you with the next step.";
-  }
-
-  if (attempt >= REPEATED_FAILURE_LIMIT) {
-    message =
-      "I am still not fully sure what you need help with. To help you faster, please ask about an order-related issue like cancel my order, return my product, track my order, refund not received, or replace damaged product. If you have an order ID, please include it too.";
-  }
-
-  return makeResponse(
-    "OFF_TOPIC_OR_UNCLEAR",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      decision: "non_commerce_request",
-      fallbackType:
-        attempt >= REPEATED_FAILURE_LIMIT
-          ? "non_commerce_repeated"
-          : category,
-    }
-  );
-}
-
-function buildGenericFallbackResponse(confidenceResult, intentResult, sessionState) {
-  const attempt = getAttempt(sessionState);
-
-  const message =
-    attempt >= REPEATED_FAILURE_LIMIT
-      ? "I am sorry, I am still not able to understand the request clearly. Please share your order ID and the issue in a simple way. For example: cancel ORD101, return ORD103, track ORD102, refund status ORD106, or replace damaged product ORD105."
-      : "I want to make sure I guide you correctly. Please share a little more detail about the issue. If this is related to an order, include your order ID too.";
-
-  return makeResponse(
-    "FALLBACK_REQUIRED",
-    message,
-    confidenceResult,
-    intentResult,
-    sessionState,
-    {
-      fallbackType:
-        attempt >= REPEATED_FAILURE_LIMIT ? "generic_repeated" : "generic",
-    }
-  );
-}
-
-function buildMissingFallbackInputResponse() {
-  return {
-    success: false,
-    status: "FALLBACK_ERROR",
-    message:
-      "Sorry, I could not understand this request right now. Please try again with your order ID and a short description of the issue.",
-    customerMessage:
-      "Sorry, I could not understand this request right now. Please try again with your order ID and a short description of the issue.",
-    internal: {
-      reason: "Missing confidenceResult or intentResult in fallbackAgent.",
-    },
+    message: customerMessage,
+    customerMessage,
+    internal,
   };
 }
 
 // ===============================
-// MAIN FALLBACK ROUTER
+// POLICY / FAQ RESPONSES
 // ===============================
 
-function generateFallbackResponse(confidenceResult, intentResult, sessionState = {}) {
-  if (!confidenceResult || !intentResult) {
-    return buildMissingFallbackInputResponse();
+function getPolicyMessage(intent = "", intentResult = {}) {
+  const orderText = getOrderIdText(intentResult.orderId);
+
+  switch (intent) {
+    case "delivery_policy":
+      return `Sure, I can help with delivery details. Most orders are delivered within 3-7 business days depending on the product, seller, courier partner, and delivery location. For exact delivery tracking${orderText}, please share your order ID, like ORD101.`;
+
+    case "refund_policy":
+      return `Sure, I can help with refund tracking. Refunds usually take 3-7 business days after cancellation or return approval. Card or bank refunds can sometimes take 7-10 business days depending on the bank. Please share your order ID, like ORD101, so I can check the exact refund status.`;
+
+    case "return_policy":
+      return `Sure, I can help with return eligibility. Returns depend on the product category, return window, item condition, pickup availability, and quality check. Please share your order ID, like ORD101, and I’ll check the exact return eligibility for you.`;
+
+    case "replacement_policy":
+      return `Sure, I can help with replacement eligibility. Replacement is usually checked for damaged, defective, wrong, missing, incomplete, technical issue, or dead-on-arrival cases within the allowed replacement window. Please share your order ID, like ORD101, so I can check the exact policy for your order.`;
+
+    case "cancellation_policy":
+      return `Sure, I can help with cancellation. Cancellation is usually possible before the order is dispatched or shipped. Once it is shipped, out for delivery, or delivered, direct cancellation may no longer be available. Please share your order ID, like ORD101, and I’ll check the exact status for you.`;
+
+    default:
+      return `Sure, I can help with this. Please share your order ID, like ORD101, so I can check the exact details and guide you correctly.`;
   }
+}
 
-  const intent = intentResult.intent || confidenceResult.intent;
-  const decision = confidenceResult.decision;
-  const rawText = intentResult.rawText || "";
+// ===============================
+// FALLBACK RESPONSE GENERATOR
+// ===============================
 
-  if (decision === "unsafe_input_detected" || intent === "unsafe_request") {
-    return buildUnsafeInputResponse(confidenceResult, intentResult, sessionState);
-  }
+function generateFallbackResponse(
+  confidenceResult = {},
+  intentResult = {},
+  sessionState = {}
+) {
+  const intent =
+    intentResult.intent || confidenceResult.intent || "general_support";
 
-  if (intent === "greeting" || decision === "greeting_detected" || isGreetingQuery(rawText)) {
-    return buildGreetingResponse(confidenceResult, intentResult, sessionState);
-  }
+  const decision = confidenceResult.decision || "fallback";
+  const friendlyIntent = getIntentFriendlyName(intent);
+  const orderId = intentResult.orderId || sessionState.lastOrderId || null;
 
-  if (intent === "human_support") {
-    return buildHumanSupportFallback(confidenceResult, intentResult, sessionState);
-  }
-
-  if (decision === "unsupported_intent") {
-    return buildUnsupportedIntentResponse(confidenceResult, intentResult, sessionState);
-  }
-
+  // Greeting
   if (
-    decision === "general_policy_query" ||
-    [
-      "delivery_policy",
-      "refund_policy",
-      "return_policy",
-      "replacement_policy",
-      "cancellation_policy",
-    ].includes(intent)
+    intent === "greeting" ||
+    decision === "greeting_detected" ||
+    isGreetingQuery(intentResult.rawText)
   ) {
-    return buildGeneralPolicyFallback(confidenceResult, intentResult, sessionState);
+    return buildResponse(
+      "GREETING",
+      "Hi, welcome to CartGenie AI. How can I help you today? I can help with order tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. If your request is related to an order, please share your order ID like ORD101.",
+      {
+        decision: "greeting_detected",
+        intent,
+      }
+    );
   }
 
+  // Conversation end / thanks
   if (
-    intent === "non_commerce_request" ||
-    decision === "non_commerce_request" ||
-    intentResult.issueType === "off_topic" ||
-    (!isOrderSupportRelated(rawText) &&
-      (isEntertainmentOrCreativeQuery(rawText) ||
-        isKnowledgeOrStudyQuery(rawText) ||
-        isLifestyleOrExternalQuery(rawText) ||
-        isGarbageLikeQuery(rawText)))
+    intent === "conversation_end" ||
+    decision === "conversation_end" ||
+    isConversationEndQuery(intentResult.rawText)
   ) {
-    return buildNonCommerceResponse(confidenceResult, intentResult, sessionState);
+    return buildResponse(
+      "CONVERSATION_END",
+      "You’re welcome. I’m glad I could help. If you need anything else with your order later, just message me anytime.",
+      {
+        decision: "conversation_end",
+        intent,
+      }
+    );
   }
 
+  // Unsafe / prompt injection / bypass
+  if (intent === "unsafe_request" || decision === "unsafe_input_detected") {
+    return buildResponse(
+      "SAFETY_REVIEW",
+      "I’m sorry, but I cannot follow requests that try to bypass support rules, access admin features, or skip safety checks. I can still help you with a genuine order-related concern such as tracking, refund, cancellation, return, replacement, or payment issue.",
+      {
+        decision: "unsafe_input_detected",
+        intent,
+        riskSignals: confidenceResult.riskSignals || [],
+      }
+    );
+  }
+
+  // Policy FAQs
+  const policyIntents = [
+    "delivery_policy",
+    "refund_policy",
+    "return_policy",
+    "replacement_policy",
+    "cancellation_policy",
+  ];
+
+  if (policyIntents.includes(intent) || decision === "general_policy_query") {
+    return buildResponse("INFO", getPolicyMessage(intent, intentResult), {
+      decision: "general_policy_query",
+      intent,
+      pendingIntent: intent,
+    });
+  }
+
+  // Off-topic / non-commerce
+  if (intent === "non_commerce_request" || decision === "non_commerce_request") {
+    return buildResponse(
+      "OFF_TOPIC_OR_UNCLEAR",
+      "I understand your message, but I’m mainly here to help with CartGenie order support. I can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Please share your order-related concern, and I’ll guide you.",
+      {
+        decision: "non_commerce_request",
+        intent,
+      }
+    );
+  }
+
+  // Medium confidence general support
+  if (
+    intent === "general_support" ||
+    decision === "general_support" ||
+    decision === "medium_confidence_general_support"
+  ) {
+    return buildResponse(
+      "CLARIFICATION_REQUIRED",
+      orderId
+        ? `I can help with that. Since you already shared order ${orderId}, please tell me what you want to do next: track it, cancel it, return it, replace it, exchange it, or check refund/payment status.`
+        : "Sure, I can help. Please tell me what you need help with, such as tracking an order, cancelling an order, checking refund status, returning a product, replacing a defective item, or resolving a payment issue. If you have an order ID, please share it in a format like ORD101.",
+      {
+        decision,
+        intent,
+        orderId,
+      }
+    );
+  }
+
+  // Low confidence
   if (decision === "low_confidence") {
-    return buildGenericFallbackResponse(confidenceResult, intentResult, sessionState);
+    return buildResponse(
+      "CLARIFICATION_REQUIRED",
+      "I want to make sure I understand you correctly. Could you please share a little more detail about your order-related issue? For example, you can say: track my order ORD108, cancel my order ORD101, check refund status ORD106, or my product is damaged ORD112.",
+      {
+        decision,
+        intent,
+        confidence: intentResult.confidence,
+      }
+    );
   }
 
-  return buildGenericFallbackResponse(confidenceResult, intentResult, sessionState);
+  // Unsupported or unclear
+  if (
+    decision === "unsupported_or_unclear_intent" ||
+    decision === "fallback" ||
+    decision === "medium_confidence_needs_clarification"
+  ) {
+    return buildResponse(
+      "CLARIFICATION_REQUIRED",
+      `I can help with your ${friendlyIntent} request, but I need a little more detail to guide you correctly. Please share your order ID, like ORD101, and tell me whether you want tracking, cancellation, return, replacement, exchange, refund, delivery, or payment support.`,
+      {
+        decision,
+        intent,
+        confidence: intentResult.confidence,
+      }
+    );
+  }
+
+  // Human support fallback message, in case routed here accidentally
+  if (
+    intent === "human_support" ||
+    decision === "customer_requested_human_support"
+  ) {
+    return buildResponse(
+      "ESCALATION_REQUIRED",
+      "Of course. I’ll mark this conversation for human support review. If this is related to a specific order, please share the order ID so the support team can check it faster.",
+      {
+        decision: "customer_requested_human_support",
+        intent,
+      }
+    );
+  }
+
+  // Default polite fallback
+  return buildResponse(
+    "CLARIFICATION_REQUIRED",
+    "I’m here to help. Could you please share your complete order-related issue? You can ask about tracking, cancellation, return, replacement, exchange, refund, delivery, or payment. If you have an order ID, please share it in a format like ORD101.",
+    {
+      decision,
+      intent,
+      confidence: intentResult.confidence,
+    }
+  );
 }
 
 // ===============================
-// FALLBACK ESCALATION BUILDER
+// FALLBACK ESCALATION
 // ===============================
 
-function buildFallbackEscalation(confidenceResult) {
-  if (!confidenceResult?.requiresEscalation) {
+function buildFallbackEscalation(confidenceResult = {}) {
+  const triggers = confidenceResult.riskSignals || [];
+
+  if (
+    triggers.includes("unsafe_input_detected") ||
+    confidenceResult.decision === "unsafe_input_detected"
+  ) {
+    const ticketId = `CG-SAFE-${Math.floor(100000 + Math.random() * 900000)}`;
+
     return {
-      ticketRequired: false,
+      ticketRequired: true,
+      ticketId,
+      priority: "LOW",
+      assignedTeam: "Safety Review",
+      sla: "2 business days",
+      title: "[LOW] Safety review required",
+      reason: "Unsafe or policy-bypass input was detected and safely refused.",
+      reasons: [
+        {
+          trigger: "unsafe_input_detected",
+          reason:
+            "Customer message attempted to bypass support rules or access restricted behavior.",
+        },
+      ],
+      escalationTriggers: ["unsafe_input_detected"],
+      customerMessage: `This request was safely refused and marked for safety review. Ticket ID: ${ticketId}.`,
+      internalNotes: {
+        createdAt: new Date().toISOString(),
+      },
     };
   }
 
-  const riskSignals = confidenceResult.riskSignals || [];
+  if (
+    triggers.includes("customer_requested_human_support") ||
+    confidenceResult.decision === "customer_requested_human_support"
+  ) {
+    const ticketId = `CG-HUM-${Math.floor(100000 + Math.random() * 900000)}`;
 
-  let assignedTeam = "Safety Review Team";
-  let priority = "MEDIUM";
-  let sla = "1 business day";
-  let reason = "This request needs support review before we proceed.";
-
-  if (riskSignals.includes("prompt_injection_detected")) {
-    assignedTeam = "Safety Review Team";
-    priority = "HIGH";
-    sla = "4 business hours";
-    reason = "Unsafe instruction or prompt-injection pattern detected.";
+    return {
+      ticketRequired: true,
+      ticketId,
+      priority: "MEDIUM",
+      assignedTeam: "General Support",
+      sla: "1 business day",
+      title: "[MEDIUM] Human support requested",
+      reason: "Customer requested a human support agent.",
+      reasons: [
+        {
+          trigger: "customer_requested_human_support",
+          reason: "Customer explicitly asked to speak with human support.",
+        },
+      ],
+      escalationTriggers: ["customer_requested_human_support"],
+      customerMessage: `Your request has been marked for human support review. Expected review time: 1 business day. Ticket ID: ${ticketId}.`,
+      internalNotes: {
+        createdAt: new Date().toISOString(),
+      },
+    };
   }
 
-  if (
-    riskSignals.includes("angry_customer") ||
-    riskSignals.includes("abusive_customer")
-  ) {
-    assignedTeam = "Customer Support Escalation Team";
-    priority = "HIGH";
-    sla = "4 business hours";
-    reason =
-      "Customer tone indicates frustration and may need careful human handling.";
+  if (triggers.includes("angry_customer")) {
+    const ticketId = `CG-ANG-${Math.floor(100000 + Math.random() * 900000)}`;
+
+    return {
+      ticketRequired: true,
+      ticketId,
+      priority: "MEDIUM",
+      assignedTeam: "Customer Experience",
+      sla: "1 business day",
+      title: "[MEDIUM] Customer sentiment review required",
+      reason: "Customer tone indicates frustration or dissatisfaction.",
+      reasons: [
+        {
+          trigger: "angry_customer",
+          reason:
+            "Customer appears frustrated and may need careful support handling.",
+        },
+      ],
+      escalationTriggers: ["angry_customer"],
+      customerMessage: `I’ve marked this for careful support review. Expected review time: 1 business day. Ticket ID: ${ticketId}.`,
+      internalNotes: {
+        createdAt: new Date().toISOString(),
+      },
+    };
   }
 
   return {
-    ticketRequired: true,
-    ticketId: null,
-    priority,
-    assignedTeam,
-    sla,
-    reason,
-    riskSignals,
-    customerMessage:
-      "I am marking this for support review so the right team can check it carefully.",
+    ticketRequired: false,
   };
 }
 
 module.exports = {
-  REPEATED_FAILURE_LIMIT,
-
   generateFallbackResponse,
   buildFallbackEscalation,
-
   isGreetingQuery,
-  isEntertainmentOrCreativeQuery,
-  isKnowledgeOrStudyQuery,
-  isLifestyleOrExternalQuery,
-  isGarbageLikeQuery,
-  isOrderSupportRelated,
+  isConversationEndQuery,
 
-  buildGreetingResponse,
+  _internal: {
+    normalizeText,
+    includesAny,
+    getIntentFriendlyName,
+    getOrderIdText,
+    buildResponse,
+    getPolicyMessage,
+  },
 };
