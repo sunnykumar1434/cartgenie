@@ -49,7 +49,10 @@ function getStatusLabel(result) {
     "order_out_for_delivery",
     "order_not_dispatched_yet",
     "tracking_available",
-    "order_cancelled"
+    "order_cancelled",
+    "refund_not_started",
+    "refund_completed",
+    "refund_initiated"
   ];
 
   if (informationalDecisions.includes(result.decision)) {
@@ -278,10 +281,7 @@ function getDecisionMessage(result = {}) {
   const estimatedDeliveryDate = formatDate(result.estimatedDeliveryDate);
 
   switch (result.decision) {
-    // ===============================
-    // GENERAL / NEW PIPELINE INTENTS
-    // ===============================
-
+    // General
     case "greeting_detected":
       return "Hi, welcome to CartGenie AI. I am here to help you with order-related support such as tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues.";
 
@@ -299,10 +299,7 @@ function getDecisionMessage(result = {}) {
         ? `Thanks for sharing order ${result.orderId}. I found this order.`
         : "Thanks for sharing the order details.";
 
-    // ===============================
-    // POLICY INFO
-    // ===============================
-
+    // Policy info
     case "delivery_policy_info":
     case "refund_policy_info":
     case "return_policy_info":
@@ -313,10 +310,7 @@ function getDecisionMessage(result = {}) {
     case "policy_info_unavailable":
       return "I can help with order policies, but I need a little more detail about what you want to know.";
 
-    // ===============================
-    // CANCELLATION
-    // ===============================
-
+    // Cancellation
     case "cancel_allowed":
       return `Sure, I can help with that. ${capitalize(orderText)} is eligible for cancellation because it has not been dispatched yet.`;
 
@@ -341,10 +335,7 @@ function getDecisionMessage(result = {}) {
     case "cancel_requires_escalation":
       return `I checked ${orderText}, but the cancellation decision is not clear enough for automatic approval.`;
 
-    // ===============================
-    // RETURN
-    // ===============================
-
+    // Return
     case "return_allowed":
       return `Sure, I can help with the return. ${capitalize(orderText)} is eligible for return. Pickup and quality check will be required before the refund is processed.`;
 
@@ -363,10 +354,10 @@ function getDecisionMessage(result = {}) {
     case "return_blocked_altered_product":
       return `${capitalize(orderText)} is not eligible for return because altered products are non-returnable and non-refundable.`;
 
-    // ===============================
-    // REPLACEMENT
-    // ===============================
+    case "return_quality_check_required":
+      return `${capitalize(orderText)} needs a manual quality-check review before return approval.`;
 
+    // Replacement
     case "replacement_allowed":
       return `Sure, I can help with the replacement. ${capitalize(orderText)} is eligible for replacement based on the reported issue and replacement window.`;
 
@@ -391,10 +382,7 @@ function getDecisionMessage(result = {}) {
     case "replacement_blocked_not_delivered":
       return `I checked ${orderText}. Replacement can be requested only after the order is delivered.`;
 
-    // ===============================
-    // REFUND
-    // ===============================
-
+    // Refund
     case "refund_initiated":
       return `The refund for ${orderText} has been initiated.`;
 
@@ -417,18 +405,30 @@ function getDecisionMessage(result = {}) {
     case "refund_pending_bank_details":
       return `The refund for ${orderText} is pending because bank details are required for the COD refund.`;
 
+    case "refund_not_started":
+      return `I checked ${orderText}. No active refund has started for this order yet.`;
+
     case "refund_not_applicable_cod_or_unpaid":
       return `I checked ${orderText}. Based on the current payment details, no prepaid refund is applicable.`;
 
     case "refund_discrepancy_escalate":
       return `I can see a refund or payment discrepancy for ${orderText}. This needs support verification before we can confirm the final status.`;
 
-    // ===============================
-    // PAYMENT
-    // ===============================
-
+    // Payment
     case "payment_issue_escalate":
       return `I understand this is a payment-related concern. A payment issue has been detected for ${orderText}.`;
+
+    case "payment_successful":
+      return `The payment for ${orderText} is marked as successful.`;
+
+    case "payment_pending":
+      return `The payment for ${orderText} is currently pending.`;
+
+    case "payment_refunded":
+      return `The payment for ${orderText} has already been refunded.`;
+
+    case "payment_status_unclear":
+      return `The payment status for ${orderText} is not clear enough for automatic resolution.`;
 
     case "cod_not_available":
       return `COD is not available for ${orderText} due to order value or payment policy limits.`;
@@ -439,10 +439,7 @@ function getDecisionMessage(result = {}) {
     case "payment_method_supported":
       return `The payment method for ${orderText} is supported, and no payment conflict is detected.`;
 
-    // ===============================
-    // EXCHANGE
-    // ===============================
-
+    // Exchange
     case "exchange_allowed":
       return `Sure, I can help with the exchange. ${capitalize(orderText)} is eligible for exchange. Pickup and quality check may be required.`;
 
@@ -450,6 +447,7 @@ function getDecisionMessage(result = {}) {
       return `I checked ${orderText}. Exchange can be requested only after the order is delivered.`;
 
     case "exchange_blocked_not_exchangeable":
+    case "exchange_blocked_non_exchangeable":
       return `I checked ${orderText}. This product is not eligible for exchange as per policy.`;
 
     case "exchange_blocked_stock_unavailable":
@@ -464,10 +462,7 @@ function getDecisionMessage(result = {}) {
     case "exchange_blocked_already_exchanged":
       return `${capitalize(orderText)} is not eligible for another exchange because one exchange has already been used.`;
 
-    // ===============================
-    // TRACKING / DELIVERY
-    // ===============================
-
+    // Tracking / Delivery
     case "tracking_available": {
       let message = `Good news, tracking is available for ${orderText}.`;
       if (trackingId) message += ` Tracking ID: ${trackingId}.`;
@@ -514,10 +509,7 @@ function getDecisionMessage(result = {}) {
     case "lost_in_transit_escalate":
       return `${capitalize(orderText)} appears to be lost in transit. This needs escalation so the logistics team can review it.`;
 
-    // ===============================
-    // COMMON
-    // ===============================
-
+    // Common
     case "order_not_found":
       return "I could not find this order in our records. Please check the order ID once and share it again.";
 
@@ -589,6 +581,8 @@ module.exports = {
     formatOrderId,
     capitalize,
     cleanMessage,
+    hasValue,
+    formatDate,
     getStatusLabel,
     getEscalationNote,
     getNextStepMessage,

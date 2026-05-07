@@ -242,8 +242,21 @@ function normalizeText(text = "") {
 }
 
 function extractOrderId(text = "") {
-  const match = String(text).match(/\bORD\d+\b/i);
-  return match ? match[0].toUpperCase() : null;
+  const raw = String(text || "").trim();
+
+  // Supports: ORD101, ord101, ODR105 typo
+  let match = raw.match(/\b(?:ORD|ODR)\s*-?\s*(\d+)\b/i);
+  if (match) {
+    return `ORD${match[1]}`.toUpperCase();
+  }
+
+  // Supports: order 101, order id 101, my order id is 101
+  match = raw.match(/\border(?:\s*id)?(?:\s*is)?\s*-?\s*(\d+)\b/i);
+  if (match) {
+    return `ORD${match[1]}`.toUpperCase();
+  }
+
+  return null;
 }
 
 function findOrder(orderId) {
@@ -313,6 +326,12 @@ function isFollowUpQuery(userQuery = "") {
     "where is it",
     "is it delivered",
     "delivered or not",
+    "cancel my order",
+    "return my order",
+    "replace my order",
+    "exchange my order",
+    "refund status",
+    "check refund",
   ];
 
   return followUpWords.some((word) => text.includes(word));
@@ -322,8 +341,7 @@ function shouldUseLastOrder(intentResult, session, userQuery) {
   if (intentResult.orderId) return false;
   if (!session.lastOrderId) return false;
 
-  if (intentResult.intent === "track_order") return true;
-  if (intentResult.intent === "refund_status") return true;
+  if (ORDER_REQUIRED_INTENTS.includes(intentResult.intent)) return true;
   if (isFollowUpQuery(userQuery)) return true;
 
   return false;
@@ -399,6 +417,13 @@ function resolveIntentWithSession(intentResult, session, userQuery) {
 
   const explicitOrderId = extractOrderId(userQuery);
 
+  if (explicitOrderId && !resolved.orderId) {
+    resolved.orderId = explicitOrderId;
+    resolved.confidence = Math.max(resolved.confidence || 0, 0.88);
+    resolved.contextResolved = true;
+    resolved.contextReason = "resolved_explicit_or_typo_order_id";
+  }
+
   if (intentResult.intent === "order_reference_only" && explicitOrderId) {
     if (session.pendingIntent) {
       resolved.intent = session.pendingIntent;
@@ -460,6 +485,194 @@ function resolveIntentWithSession(intentResult, session, userQuery) {
   }
 
   return resolved;
+}
+
+function getPolicyFollowUpIntent(intent) {
+  const map = {
+    delivery_policy: "track_order",
+    refund_policy: "refund_status",
+    return_policy: "return_order",
+    replacement_policy: "replace_order",
+    cancellation_policy: "cancel_order",
+  };
+
+  return map[intent] || null;
+}
+
+function isOrderIdFaq(userQuery = "") {
+  const text = normalizeText(userQuery);
+
+  return (
+    text.includes("what is order id") ||
+    text.includes("what is my order id") ||
+    text.includes("where is order id") ||
+    text.includes("where is my order id") ||
+    text.includes("where to see my order id") ||
+    text.includes("where can i see my order id") ||
+    text.includes("how to check order id") ||
+    text.includes("how can i check order id") ||
+    text.includes("how do i find order id") ||
+    text.includes("find my order id")
+  );
+}
+
+function isCancellationFaq(userQuery = "") {
+  const text = normalizeText(userQuery);
+
+  return (
+    text.includes("how can i cancel") ||
+    text.includes("how to cancel") ||
+    text.includes("cancellation process") ||
+    text.includes("why was my cancellation request rejected") ||
+    text.includes("reactivate my cancelled")
+  );
+}
+
+function isRefundFaq(userQuery = "") {
+  const text = normalizeText(userQuery);
+
+  return (
+    text.includes("how long does the refund") ||
+    text.includes("how long refund") ||
+    text.includes("refund process take") ||
+    text.includes("how refund works") ||
+    text.includes("where can i check my refund") ||
+    text.includes("where to check refund")
+  );
+}
+
+function isSubscriptionOrAccountQuery(userQuery = "") {
+  const text = normalizeText(userQuery);
+
+  return [
+    "subscription",
+    "membership",
+    "premium plan",
+    "premium subscription",
+    "downgrade",
+    "renewal",
+    "account",
+    "billed",
+    "billing",
+    "gift card",
+    "wrong plan",
+  ].some((word) => text.includes(word));
+}
+
+function buildDirectInfoResult(sessionId, userQuery, infoType, message, extra = {}) {
+  const session = updateSession(sessionId, {
+    fallbackCount: 0,
+    clarificationCount: 0,
+    totalFailureCount: 0,
+    lastIntent: infoType,
+    lastStage: "direct_info",
+    lastQuery: userQuery,
+    pendingIntent: extra.pendingIntent || null,
+    pendingMissingEntity: extra.pendingIntent ? "orderId" : null,
+    pendingIssueType: extra.pendingIssueType || "general",
+  });
+
+  const intentResult = {
+    intent: infoType,
+    confidence: 1,
+    orderId: null,
+    issueType: extra.pendingIssueType || "general",
+    rawText: userQuery,
+    source: "local_direct_info_handler",
+  };
+
+  const confidenceResult = {
+    originalConfidence: 1,
+    normalizedConfidence: 1,
+    highThreshold: 0.75,
+    lowThreshold: 0.5,
+    intent: infoType,
+    route: "direct_info",
+    decision: infoType,
+    allowedToUseRuleEngine: false,
+    requiresFallback: false,
+    requiresClarification: false,
+    requiresEscalation: false,
+    missingEntities: [],
+    riskSignals: [],
+    reason: "Direct FAQ or general support answer.",
+    metadata: {
+      orderId: null,
+      issueType: extra.pendingIssueType || "general",
+    },
+  };
+
+  return {
+    success: true,
+    stage: "direct_info",
+    query: userQuery,
+    sessionId,
+    sessionState: session,
+    intentResult,
+    confidenceResult,
+    orderFound: false,
+    orderSummary: null,
+    ruleResult: null,
+    response: {
+      success: true,
+      status: "INFO",
+      message,
+      customerMessage: message,
+      internal: {
+        decision: infoType,
+        pendingIntent: extra.pendingIntent || null,
+      },
+    },
+    escalation: {
+      ticketRequired: false,
+    },
+  };
+}
+
+function buildDirectAnswerIfMatched(sessionId, userQuery, session) {
+  if (isOrderIdFaq(userQuery)) {
+    return buildDirectInfoResult(
+      sessionId,
+      userQuery,
+      "order_id_faq",
+      "Your order ID is usually available in your order confirmation email/SMS, invoice, or the order history section of your account. It looks like ORD101. If you share it here, I can help you track, cancel, return, replace, or check refund status."
+    );
+  }
+
+  if (isRefundFaq(userQuery)) {
+    return buildDirectInfoResult(
+      sessionId,
+      userQuery,
+      "refund_policy",
+      session.lastOrderId
+        ? `Refund timelines usually depend on payment method and the current order stage. Since you already shared ${session.lastOrderId}, you can ask "check refund status" and I will use that order.`
+        : "Refunds usually take 3-7 business days after cancellation/return approval. Card refunds can take 7-10 business days, while wallet refunds may be faster. Share your order ID if you want the exact refund status.",
+      { pendingIntent: "refund_status", pendingIssueType: "refund_dispute" }
+    );
+  }
+
+  if (isCancellationFaq(userQuery)) {
+    return buildDirectInfoResult(
+      sessionId,
+      userQuery,
+      "cancellation_policy",
+      session.lastOrderId
+        ? `Cancellation is usually possible before dispatch/shipment. Since you already shared ${session.lastOrderId}, you can say "cancel my order" and I will check that order.`
+        : "You can cancel an order before it is dispatched or shipped. Share your order ID, for example ORD101, and I will check whether cancellation is available.",
+      { pendingIntent: "cancel_order", pendingIssueType: "general" }
+    );
+  }
+
+  if (isSubscriptionOrAccountQuery(userQuery)) {
+    return buildDirectInfoResult(
+      sessionId,
+      userQuery,
+      "account_or_subscription_help",
+      "I can help with order support in this demo. For subscription, membership, account, billing, plan downgrade, or gift-card refund issues, please share the related account/order details if available. If this action is not supported automatically, I will explain the limitation and suggest the next best step instead of ending the conversation."
+    );
+  }
+
+  return null;
 }
 
 function buildGreetingResult(sessionId, userQuery) {
@@ -567,12 +780,18 @@ function buildHumanSupportResult(
   intentResult,
   confidenceResult
 ) {
+  const existingSession = getSession(sessionId);
+
   const session = updateSession(sessionId, {
     lastIntent: "human_support",
+    lastOrderId: intentResult.orderId || existingSession.lastOrderId || null,
+    lastIssueType:
+      intentResult.issueType || existingSession.lastIssueType || "general",
     lastStage: "human_support_requested",
     lastQuery: userQuery,
-    pendingIntent: null,
-    pendingMissingEntity: null,
+    pendingIntent: "human_support",
+    pendingMissingEntity:
+      intentResult.orderId || existingSession.lastOrderId ? null : "orderId",
   });
 
   const ticketId = `CG-HUM-${String(sessionId).replace(
@@ -724,6 +943,16 @@ async function runCartGeniePipeline(userQuery, options = {}) {
     return buildGreetingResult(sessionId, userQuery);
   }
 
+  const directAnswer = buildDirectAnswerIfMatched(
+    sessionId,
+    userQuery,
+    existingSession
+  );
+
+  if (directAnswer) {
+    return directAnswer;
+  }
+
   const rawIntentResult = await detectIntentAndEntities(userQuery);
 
   const intentResult = resolveIntentWithSession(
@@ -831,15 +1060,19 @@ async function runCartGeniePipeline(userQuery, options = {}) {
     let session;
 
     if (nonFailureFallback) {
+      const policyFollowUpIntent = getPolicyFollowUpIntent(
+        intentResult.intent || confidenceResult.intent
+      );
+
       session = updateSession(sessionId, {
         lastIntent: intentResult.intent || confidenceResult.intent,
         lastOrderId: intentResult.orderId || existingSession.lastOrderId,
         lastIssueType: intentResult.issueType || "general",
         lastStage: fallbackStage,
         lastQuery: userQuery,
-        pendingIntent: null,
-        pendingMissingEntity: null,
-        pendingIssueType: null,
+        pendingIntent: policyFollowUpIntent,
+        pendingMissingEntity: policyFollowUpIntent ? "orderId" : null,
+        pendingIssueType: intentResult.issueType || "general",
       });
     } else if (confidenceResult.decision === "unsafe_input_detected") {
       session = updateSession(sessionId, {
