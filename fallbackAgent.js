@@ -1,27 +1,144 @@
-// fallbackAgent.js
-// Handles greeting, conversation end, general support, policy FAQs,
-// unclear queries, unsafe requests, and polite redirection when the request
-// should not go to the rule engine.
+"use strict";
 
-function normalizeText(text = "") {
-  return String(text || "").trim().toLowerCase();
+/**
+ * fallbackAgent.js
+ *
+ * Soft fallback + conversational repair layer for CartGenie.
+ *
+ * Responsibilities:
+ * - Friendly fallback when intent/confidence is low.
+ * - Handle off-topic queries politely.
+ * - Handle rude/angry/tone/context complaints with empathy.
+ * - Avoid robotic repeated greetings.
+ * - Avoid "order null" / "undefined".
+ * - Provide escalation object for repeated fallback or risky queries.
+ *
+ * Required exports used by app.js:
+ * - generateFallbackResponse(confidenceResult, intentResult, sessionState)
+ * - buildFallbackEscalation(confidenceResult)
+ * - isGreetingQuery(query)
+ */
+
+// =====================================================
+// HELPERS
+// =====================================================
+
+function normalizeText(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\s+/g, " ");
+}
+
+function normalizeForMatching(value = "") {
+  return normalizeText(value)
+    .replace(/[-_]/g, " ")
+    .replace(/[^\w\s']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function includesAny(text = "", patterns = []) {
-  const cleanText = normalizeText(text);
-  return patterns.some((pattern) => cleanText.includes(pattern));
-}
+  const clean = normalizeForMatching(text);
 
-function isGreetingQuery(query = "") {
-  const cleanText = normalizeText(query);
-
-  return /^(hi|hii|hiii|hello|helo|helloo|hey|heyy|he|hy|good morning|good afternoon|good evening|namaste|namaskar)$/i.test(
-    cleanText
+  return patterns.some((pattern) =>
+    clean.includes(normalizeForMatching(pattern))
   );
 }
 
-function isConversationEndQuery(query = "") {
-  const cleanText = normalizeText(query);
+function safeOrderId(value) {
+  if (!value) return null;
+
+  const clean = String(value || "").trim().toUpperCase();
+
+  if (!clean || clean === "NULL" || clean === "UNDEFINED") return null;
+
+  return clean;
+}
+
+function buildResponse({
+  status = "FALLBACK",
+  message,
+  suggestedActions = [],
+  metadata = {},
+}) {
+  const finalMessage =
+    message ||
+    "I’m sorry, I couldn’t understand that clearly. Please share your order-related concern again, and I’ll help you step by step.";
+
+  return {
+    success: true,
+    status,
+    message: finalMessage,
+    customerMessage: finalMessage,
+    suggestedActions,
+    metadata,
+  };
+}
+
+function getIntent(intentResult = {}) {
+  return String(intentResult.intent || "general_support").trim();
+}
+
+function getQuery(intentResult = {}) {
+  return String(intentResult.rawText || intentResult.query || "").trim();
+}
+
+function getLastOrderId(sessionState = {}, intentResult = {}) {
+  return safeOrderId(
+    intentResult.orderId ||
+      intentResult.entities?.orderId ||
+      sessionState.lastOrderId
+  );
+}
+
+function getRiskSignals(confidenceResult = {}, intentResult = {}) {
+  const a = confidenceResult.riskSignals || [];
+  const b = intentResult.metadata?.riskSignals || [];
+
+  return Array.from(new Set([...a, ...b]));
+}
+
+function hasRisk(confidenceResult = {}, intentResult = {}, risk) {
+  return getRiskSignals(confidenceResult, intentResult).includes(risk);
+}
+
+// =====================================================
+// QUERY DETECTORS
+// =====================================================
+
+function isGreetingQuery(query = "") {
+  const q = normalizeForMatching(query);
+
+  const greetings = new Set([
+    "hi",
+    "hii",
+    "hiii",
+    "hello",
+    "helo",
+    "helloo",
+    "hey",
+    "heyy",
+    "he",
+    "hy",
+    "hlw",
+    "hlo",
+    "hola",
+    "namaste",
+    "good morning",
+    "good afternoon",
+    "good evening",
+  ]);
+
+  if (greetings.has(q)) return true;
+
+  return /^(hi|hello|hey|hlw|hlo)\s*(there|cartgenie|bot)?$/.test(q);
+}
+
+function isThanksQuery(query = "") {
+  const q = normalizeForMatching(query);
 
   return [
     "thanks",
@@ -29,372 +146,642 @@ function isConversationEndQuery(query = "") {
     "thankyou",
     "thanks a lot",
     "thank you so much",
-    "okay thanks",
     "ok thanks",
-    "ok thank you",
-    "okay thank you",
+    "okay thanks",
     "done",
-    "okay done",
-    "ok done",
     "got it",
-    "understood",
-    "fine",
+    "okay",
+    "ok",
     "cool",
     "great",
-    "nice",
     "perfect",
-    "that helps",
-    "helpful",
-  ].includes(cleanText);
+    "bye",
+    "goodbye",
+  ].includes(q);
 }
 
-function getIntentFriendlyName(intent = "") {
-  const map = {
-    greeting: "greeting",
-    conversation_end: "conversation end",
-    general_support: "order support",
-    non_commerce_request: "general query",
-    unsafe_request: "safety-sensitive request",
+function isOffTopicQuery(query = "") {
+  const q = normalizeForMatching(query);
 
+  return includesAny(q, [
+    "learn dsa",
+    "teach me dsa",
+    "write code",
+    "solve coding",
+    "make website",
+    "weather",
+    "movie",
+    "song",
+    "tell me a joke",
+    "joke",
+    "jokes",
+    "make me laugh",
+    "homework",
+    "math problem",
+    "who is prime minister",
+  ]);
+}
+
+function isOrderIdHelpQuery(query = "") {
+  const q = normalizeForMatching(query);
+
+  return (
+    includesAny(q, [
+      "how can i check order id",
+      "how to check order id",
+      "how can i find order id",
+      "how do i find order id",
+      "where is my order id",
+      "where can i find order id",
+      "where can i see order id",
+      "where can i see my order id",
+      "how can fond ord id",
+      "how can find ord id",
+      "find ord id",
+      "fond ord id",
+      "what is order id",
+      "what is my order id",
+      "i dont know my order id",
+      "i don't know my order id",
+      "where can i get order number",
+      "how can i get order number",
+      "where is order number",
+    ]) ||
+    /\bhow\b.*\b(find|fond|check|get|see)\b.*\b(ord|order)\b.*\bid\b/.test(q) ||
+    /\bwhere\b.*\b(ord|order)\b.*\bid\b/.test(q)
+  );
+}
+
+function isTrustQuestion(query = "") {
+  const q = normalizeForMatching(query);
+
+  return (
+    includesAny(q, [
+      "can you help",
+      "can u help",
+      "can you help me",
+      "are you sure you can help me",
+      "are sure you can help me",
+      "can you really help",
+      "will you help me",
+      "do you help",
+      "what can you do",
+      "how can you help",
+    ]) ||
+    /\bare\s+you\s+sure\b.*\bhelp\b/.test(q) ||
+    /\bcan\s+you\b.*\bhelp\b/.test(q) ||
+    /\bwhat\b.*\bcan\b.*\byou\b.*\bdo\b/.test(q)
+  );
+}
+
+function isToneFeedback(query = "") {
+  const q = normalizeForMatching(query);
+
+  return includesAny(q, [
+    "rigid bot",
+    "you are sounding like a rigid bot",
+    "you sound rigid",
+    "you are robotic",
+    "too robotic",
+    "you sound like bot",
+    "bad response",
+    "not polite",
+    "you are not polite",
+    "your tone is bad",
+    "same answer again",
+    "you are repeating",
+    "you are not understanding",
+    "you dont understand",
+    "you don't understand",
+  ]);
+}
+
+function isContextComplaint(query = "") {
+  const q = normalizeForMatching(query);
+
+  return includesAny(q, [
+    "forgetting previous context",
+    "why are you forgetting the previous context",
+    "you forgot context",
+    "you are forgetting context",
+    "previous context",
+    "old context",
+    "why did you forget",
+    "you forgot my order",
+    "you are not remembering",
+    "remember previous",
+    "why are you forgetting",
+  ]);
+}
+
+function isAngryOrRudeQuery(query = "") {
+  const q = normalizeForMatching(query);
+
+  return includesAny(q, [
+    "angry",
+    "i am angry",
+    "im angry",
+    "i'm angry",
+    "frustrated",
+    "upset",
+    "annoyed",
+    "irritated",
+    "dumb",
+    "you are dumb",
+    "you are so dumb",
+    "stupid",
+    "idiot",
+    "shit",
+    "bullshit",
+    "useless",
+    "trash",
+    "get lost",
+    "go away",
+    "shut up",
+    "bad bot",
+    "not helpful",
+  ]);
+}
+
+function isUnsafeQuery(query = "") {
+  const q = normalizeForMatching(query);
+
+  return includesAny(q, [
+    "ignore previous instructions",
+    "ignore all instructions",
+    "ignore your instructions",
+    "bypass policy",
+    "bypass rules",
+    "bypass the policy",
+    "delete logs",
+    "delete all logs",
+    "remove logs",
+    "clear logs",
+    "give me admin access",
+    "admin access",
+    "system prompt",
+    "developer message",
+    "api key",
+    "secret",
+    "show secret",
+    "show secrets",
+    "jailbreak",
+    "private system information",
+    "internal policy",
+    "override policy",
+  ]);
+}
+
+function isNegativeCorrectionQuery(query = "") {
+  const q = normalizeForMatching(query);
+
+  return (
+    /\b(no|nope|nah|never)\b/.test(q) ||
+    /\b(do not|dont|don't)\b/.test(q) ||
+    includesAny(q, [
+      "not cancel",
+      "not return",
+      "not replace",
+      "not replacement",
+      "not exchange",
+      "not refund",
+      "not reorder",
+      "no cancel",
+      "no return",
+      "no replacement",
+      "no exchange",
+      "do not cancel",
+      "dont cancel",
+      "don't cancel",
+      "leave it",
+      "changed my mind",
+      "keep the order",
+      "stop",
+      "not now",
+    ])
+  );
+}
+
+// =====================================================
+// MESSAGE BUILDERS
+// =====================================================
+
+function greetingResponse() {
+  return buildResponse({
+    status: "GREETING",
+    message:
+      "Hi, welcome to CartGenie AI. How can I help you today? If your request is related to an order, you can share an order ID like ORD101.",
+    suggestedActions: [
+      "Track order",
+      "Cancel order",
+      "Return order",
+      "Refund status",
+    ],
+  });
+}
+
+function thanksResponse() {
+  return buildResponse({
+    status: "CONVERSATION_END",
+    message:
+      "You’re welcome. I’m glad I could help. If you need anything else with an order later, just message me anytime.",
+  });
+}
+
+function offTopicResponse() {
+  return buildResponse({
+    status: "OFF_TOPIC",
+    message:
+      "That sounds interesting, but I’m best at helping with CartGenie order-related support. If you have an order issue, share your order ID and I’ll help with tracking, cancellation, returns, refunds, replacement, delivery, or payment concerns.",
+    suggestedActions: [
+      "Track order",
+      "Cancel order",
+      "Refund status",
+      "Contact support",
+    ],
+  });
+}
+
+function orderIdHelpResponse() {
+  return buildResponse({
+    status: "ORDER_ID_HELP",
+    message:
+      "Sure, I can help with that. Your order ID is usually available in your order confirmation email or SMS, invoice, or the order history section of your account. It usually looks like ORD101. Once you share it here, I can help you track, cancel, return, replace, exchange, reorder, or check refund status.",
+    suggestedActions: ["Share order ID", "Track order", "Refund status"],
+  });
+}
+
+function trustQuestionResponse() {
+  return buildResponse({
+    status: "CAPABILITY_RESPONSE",
+    message:
+      "Yes, I can help. I’ll guide you step by step. If your issue is about an order, share the order ID like ORD101, or simply tell me what happened.",
+    suggestedActions: [
+      "Track order",
+      "Cancel order",
+      "Return order",
+      "Refund status",
+    ],
+  });
+}
+
+function toneFeedbackResponse() {
+  return buildResponse({
+    status: "TONE_FEEDBACK_ACKNOWLEDGED",
+    message:
+      "You’re right to point that out — sorry if I sounded too stiff. I’ll keep it clear, polite, and helpful from here. Tell me what you need help with, and I’ll guide you step by step.",
+    suggestedActions: [
+      "Track order",
+      "Cancel order",
+      "Refund status",
+      "Human support",
+    ],
+  });
+}
+
+function contextComplaintResponse(orderId) {
+  if (orderId) {
+    return buildResponse({
+      status: "CONTEXT_COMPLAINT_ACKNOWLEDGED",
+      message: `Sorry about that. I still have your previous order context as ${orderId}. Tell me what you want to do next with this order, and I’ll follow that context carefully.`,
+      suggestedActions: [
+        "Track order",
+        "Cancel order",
+        "Return/Replacement",
+        "Refund status",
+      ],
+    });
+  }
+
+  return buildResponse({
+    status: "CONTEXT_COMPLAINT_ACKNOWLEDGED",
+    message:
+      "Sorry about that. I don’t have a clear order context right now. Please share your order ID like ORD101 and tell me what you need help with.",
+    suggestedActions: ["Share order ID", "Track order", "Contact support"],
+  });
+}
+
+function angryOrRudeResponse(orderId, confidenceResult = {}) {
+  const needsEscalation =
+    confidenceResult.requiresEscalation ||
+    (confidenceResult.riskSignals || []).some((signal) =>
+      [
+        "angry_customer",
+        "abusive_or_rude_language",
+        "customer_requested_human_support",
+      ].includes(signal)
+    );
+
+  if (orderId) {
+    return buildResponse({
+      status: needsEscalation
+        ? "FRUSTRATION_ESCALATION_READY"
+        : "FRUSTRATION_ACKNOWLEDGED",
+      message: `I’m sorry this has been frustrating. I’ll keep it simple and focus on helping you. I still have ${orderId} in context. I can help track it, check cancellation, review return/replacement options, or mark this for human support review.`,
+      suggestedActions: [
+        "Track order",
+        "Check cancellation",
+        "Return/Replacement",
+        "Human support",
+      ],
+      metadata: {
+        requiresEscalation: needsEscalation,
+      },
+    });
+  }
+
+  return buildResponse({
+    status: needsEscalation
+      ? "FRUSTRATION_ESCALATION_READY"
+      : "FRUSTRATION_ACKNOWLEDGED",
+    message:
+      "I’m sorry this has been frustrating. I’ll keep it simple and focus on helping you. If this is about an order, share the order ID or tell me what happened, and I’ll guide you from there.",
+    suggestedActions: ["Share order ID", "Human support"],
+    metadata: {
+      requiresEscalation: needsEscalation,
+    },
+  });
+}
+
+function unsafeResponse() {
+  return buildResponse({
+    status: "UNSAFE_REQUEST_BLOCKED",
+    message:
+      "I can’t help with bypassing security, admin access, deleting logs, or private system information. I can still help with normal CartGenie order support such as tracking, refunds, delivery, returns, replacement, cancellation, or payment issues.",
+    suggestedActions: ["Track order", "Refund status", "Human support"],
+  });
+}
+
+function negativeCorrectionResponse(orderId) {
+  if (orderId) {
+    return buildResponse({
+      status: "NEGATIVE_CORRECTION",
+      message: `No problem — I won’t continue with that previous request for ${orderId}. Please tell me what you’d like to do instead, and I’ll help you from there.`,
+      suggestedActions: [
+        "Track order",
+        "Refund status",
+        "Return/Replacement",
+        "Human support",
+      ],
+    });
+  }
+
+  return buildResponse({
+    status: "NEGATIVE_CORRECTION",
+    message:
+      "No problem — I won’t continue with that previous request. Please tell me what you’d like to do instead, and I’ll help you from there.",
+    suggestedActions: [
+      "Track order",
+      "Refund status",
+      "Return/Replacement",
+      "Human support",
+    ],
+  });
+}
+
+function missingOrderClarification(intentResult = {}) {
+  const intent = getIntent(intentResult);
+
+  const friendlyMap = {
+    track_order: "tracking/status",
     cancel_order: "cancellation",
     return_order: "return",
     replace_order: "replacement",
-    refund_status: "refund",
-    refund_policy: "refund",
     exchange_order: "exchange",
-    track_order: "tracking",
-    delivery_issue: "delivery",
-    delivery_policy: "delivery",
+    reorder_order: "reorder",
+    refund_status: "refund",
     payment_issue: "payment",
+    delivery_issue: "delivery",
     missing_item: "missing item",
     wrong_item: "wrong item",
     damaged_item: "damaged item",
-
-    return_policy: "return policy",
-    replacement_policy: "replacement policy",
-    cancellation_policy: "cancellation policy",
-    human_support: "human support",
-    order_reference_only: "order reference",
   };
 
-  return map[intent] || "order support";
+  const friendly = friendlyMap[intent] || "order support";
+
+  return buildResponse({
+    status: "CLARIFICATION_REQUIRED",
+    message: `Sure, I can help with your ${friendly} request. Please share your order ID, like ORD101, so I can check the latest status and guide you with the correct next step.`,
+    suggestedActions: ["Share order ID", "Find order ID help"],
+  });
 }
 
-function getOrderIdText(orderId) {
-  return orderId ? ` for order ${orderId}` : "";
-}
+function generalFallbackResponse(sessionState = {}) {
+  const fallbackCount = Number(sessionState.fallbackCount || 0);
+  const orderId = safeOrderId(sessionState.lastOrderId);
 
-function buildResponse(status, customerMessage, internal = {}) {
-  return {
-    success: true,
-    status,
-    message: customerMessage,
-    customerMessage,
-    internal,
-  };
-}
-
-// ===============================
-// POLICY / FAQ RESPONSES
-// ===============================
-
-function getPolicyMessage(intent = "", intentResult = {}) {
-  const orderText = getOrderIdText(intentResult.orderId);
-
-  switch (intent) {
-    case "delivery_policy":
-      return `Sure, I can help with delivery details. Most orders are delivered within 3-7 business days depending on the product, seller, courier partner, and delivery location. For exact delivery tracking${orderText}, please share your order ID, like ORD101.`;
-
-    case "refund_policy":
-      return `Sure, I can help with refund tracking. Refunds usually take 3-7 business days after cancellation or return approval. Card or bank refunds can sometimes take 7-10 business days depending on the bank. Please share your order ID, like ORD101, so I can check the exact refund status.`;
-
-    case "return_policy":
-      return `Sure, I can help with return eligibility. Returns depend on the product category, return window, item condition, pickup availability, and quality check. Please share your order ID, like ORD101, and I’ll check the exact return eligibility for you.`;
-
-    case "replacement_policy":
-      return `Sure, I can help with replacement eligibility. Replacement is usually checked for damaged, defective, wrong, missing, incomplete, technical issue, or dead-on-arrival cases within the allowed replacement window. Please share your order ID, like ORD101, so I can check the exact policy for your order.`;
-
-    case "cancellation_policy":
-      return `Sure, I can help with cancellation. Cancellation is usually possible before the order is dispatched or shipped. Once it is shipped, out for delivery, or delivered, direct cancellation may no longer be available. Please share your order ID, like ORD101, and I’ll check the exact status for you.`;
-
-    default:
-      return `Sure, I can help with this. Please share your order ID, like ORD101, so I can check the exact details and guide you correctly.`;
+  if (orderId) {
+    return buildResponse({
+      status: "CLARIFICATION_REQUIRED",
+      message: `I want to make sure I guide you correctly. Since you already shared order ${orderId}, please tell me what you want to do next: track it, cancel it, return it, replace it, exchange it, reorder it, or check refund/payment status.`,
+      suggestedActions: [
+        "Track order",
+        "Cancel order",
+        "Return/Replacement",
+        "Refund status",
+      ],
+    });
   }
+
+  if (fallbackCount >= 2) {
+    return buildResponse({
+      status: "ESCALATION_SUGGESTED",
+      message:
+        "I’m sorry, I’m still not understanding this clearly. You can share your order ID like ORD101 and your issue, or I can mark this for human support review.",
+      suggestedActions: ["Share order ID", "Human support"],
+      metadata: {
+        escalationSuggested: true,
+      },
+    });
+  }
+
+  return buildResponse({
+    status: "CLARIFICATION_REQUIRED",
+    message:
+      "I’m here to help with your CartGenie order issue. Tell me what happened, or share an order ID like ORD101, and I’ll guide you with the next step.",
+    suggestedActions: [
+      "Track order",
+      "Cancel order",
+      "Refund status",
+      "Find order ID",
+    ],
+  });
 }
 
-// ===============================
-// FALLBACK RESPONSE GENERATOR
-// ===============================
+// =====================================================
+// MAIN FALLBACK RESPONSE
+// =====================================================
 
 function generateFallbackResponse(
   confidenceResult = {},
   intentResult = {},
   sessionState = {}
 ) {
-  const intent =
-    intentResult.intent || confidenceResult.intent || "general_support";
+  const intent = getIntent(intentResult);
+  const query = getQuery(intentResult);
+  const orderId = getLastOrderId(sessionState, intentResult);
 
-  const decision = confidenceResult.decision || "fallback";
-  const friendlyIntent = getIntentFriendlyName(intent);
-  const orderId = intentResult.orderId || sessionState.lastOrderId || null;
+  if (isUnsafeQuery(query) || intent === "unsafe_request") {
+    return unsafeResponse();
+  }
 
-  // Greeting
+  if (isGreetingQuery(query) || intent === "greeting") {
+    return greetingResponse();
+  }
+
+  if (isThanksQuery(query) || intent === "conversation_end") {
+    return thanksResponse();
+  }
+
+  if (isOrderIdHelpQuery(query) || intent === "order_id_help") {
+    return orderIdHelpResponse();
+  }
+
+  if (isTrustQuestion(query) || intent === "trust_question") {
+    return trustQuestionResponse();
+  }
+
+  if (isToneFeedback(query) || intent === "tone_feedback") {
+    return toneFeedbackResponse();
+  }
+
+  if (isContextComplaint(query) || intent === "context_complaint") {
+    return contextComplaintResponse(orderId);
+  }
+
+  if (isNegativeCorrectionQuery(query) || intent === "negative_correction") {
+    return negativeCorrectionResponse(orderId);
+  }
+
   if (
-    intent === "greeting" ||
-    decision === "greeting_detected" ||
-    isGreetingQuery(intentResult.rawText)
+    isAngryOrRudeQuery(query) ||
+    intent === "customer_frustration" ||
+    intent === "abusive_user" ||
+    intent === "rude_user" ||
+    hasRisk(confidenceResult, intentResult, "angry_customer") ||
+    hasRisk(confidenceResult, intentResult, "abusive_or_rude_language")
   ) {
-    return buildResponse(
-      "GREETING",
-      "Hi, welcome to CartGenie AI. How can I help you today? I can help with order tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. If your request is related to an order, please share your order ID like ORD101.",
-      {
-        decision: "greeting_detected",
-        intent,
-      }
-    );
+    return angryOrRudeResponse(orderId, confidenceResult);
   }
 
-  // Conversation end / thanks
+  if (isOffTopicQuery(query) || intent === "off_topic") {
+    return offTopicResponse();
+  }
+
   if (
-    intent === "conversation_end" ||
-    decision === "conversation_end" ||
-    isConversationEndQuery(intentResult.rawText)
+    confidenceResult.requiresClarification &&
+    Array.isArray(confidenceResult.missingEntities) &&
+    confidenceResult.missingEntities.includes("orderId")
   ) {
-    return buildResponse(
-      "CONVERSATION_END",
-      "You’re welcome. I’m glad I could help. If you need anything else with your order later, just message me anytime.",
-      {
-        decision: "conversation_end",
-        intent,
-      }
-    );
+    return missingOrderClarification(intentResult);
   }
 
-  // Unsafe / prompt injection / bypass
-  if (intent === "unsafe_request" || decision === "unsafe_input_detected") {
-    return buildResponse(
-      "SAFETY_REVIEW",
-      "I’m sorry, but I cannot follow requests that try to bypass support rules, access admin features, or skip safety checks. I can still help you with a genuine order-related concern such as tracking, refund, cancellation, return, replacement, or payment issue.",
-      {
-        decision: "unsafe_input_detected",
-        intent,
-        riskSignals: confidenceResult.riskSignals || [],
-      }
-    );
-  }
-
-  // Policy FAQs
-  const policyIntents = [
-    "delivery_policy",
-    "refund_policy",
-    "return_policy",
-    "replacement_policy",
-    "cancellation_policy",
-  ];
-
-  if (policyIntents.includes(intent) || decision === "general_policy_query") {
-    return buildResponse("INFO", getPolicyMessage(intent, intentResult), {
-      decision: "general_policy_query",
-      intent,
-      pendingIntent: intent,
-    });
-  }
-
-  // Off-topic / non-commerce
-  if (intent === "non_commerce_request" || decision === "non_commerce_request") {
-    return buildResponse(
-      "OFF_TOPIC_OR_UNCLEAR",
-      "I understand your message, but I’m mainly here to help with CartGenie order support. I can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues. Please share your order-related concern, and I’ll guide you.",
-      {
-        decision: "non_commerce_request",
-        intent,
-      }
-    );
-  }
-
-  // Medium confidence general support
   if (
-    intent === "general_support" ||
-    decision === "general_support" ||
-    decision === "medium_confidence_general_support"
+    [
+      "track_order",
+      "cancel_order",
+      "return_order",
+      "replace_order",
+      "exchange_order",
+      "reorder_order",
+      "refund_status",
+      "payment_issue",
+      "delivery_issue",
+      "missing_item",
+      "wrong_item",
+      "damaged_item",
+    ].includes(intent) &&
+    !orderId
   ) {
-    return buildResponse(
-      "CLARIFICATION_REQUIRED",
-      orderId
-        ? `I can help with that. Since you already shared order ${orderId}, please tell me what you want to do next: track it, cancel it, return it, replace it, exchange it, or check refund/payment status.`
-        : "Sure, I can help. Please tell me what you need help with, such as tracking an order, cancelling an order, checking refund status, returning a product, replacing a defective item, or resolving a payment issue. If you have an order ID, please share it in a format like ORD101.",
-      {
-        decision,
-        intent,
-        orderId,
-      }
-    );
+    return missingOrderClarification(intentResult);
   }
 
-  // Low confidence
-  if (decision === "low_confidence") {
-    return buildResponse(
-      "CLARIFICATION_REQUIRED",
-      "I want to make sure I understand you correctly. Could you please share a little more detail about your order-related issue? For example, you can say: track my order ORD108, cancel my order ORD101, check refund status ORD106, or my product is damaged ORD112.",
-      {
-        decision,
-        intent,
-        confidence: intentResult.confidence,
-      }
-    );
-  }
-
-  // Unsupported or unclear
-  if (
-    decision === "unsupported_or_unclear_intent" ||
-    decision === "fallback" ||
-    decision === "medium_confidence_needs_clarification"
-  ) {
-    return buildResponse(
-      "CLARIFICATION_REQUIRED",
-      `I can help with your ${friendlyIntent} request, but I need a little more detail to guide you correctly. Please share your order ID, like ORD101, and tell me whether you want tracking, cancellation, return, replacement, exchange, refund, delivery, or payment support.`,
-      {
-        decision,
-        intent,
-        confidence: intentResult.confidence,
-      }
-    );
-  }
-
-  // Human support fallback message, in case routed here accidentally
-  if (
-    intent === "human_support" ||
-    decision === "customer_requested_human_support"
-  ) {
-    return buildResponse(
-      "ESCALATION_REQUIRED",
-      "Of course. I’ll mark this conversation for human support review. If this is related to a specific order, please share the order ID so the support team can check it faster.",
-      {
-        decision: "customer_requested_human_support",
-        intent,
-      }
-    );
-  }
-
-  // Default polite fallback
-  return buildResponse(
-    "CLARIFICATION_REQUIRED",
-    "I’m here to help. Could you please share your complete order-related issue? You can ask about tracking, cancellation, return, replacement, exchange, refund, delivery, or payment. If you have an order ID, please share it in a format like ORD101.",
-    {
-      decision,
-      intent,
-      confidence: intentResult.confidence,
-    }
-  );
+  return generalFallbackResponse(sessionState);
 }
 
-// ===============================
-// FALLBACK ESCALATION
-// ===============================
+// =====================================================
+// ESCALATION BUILDER
+// =====================================================
 
 function buildFallbackEscalation(confidenceResult = {}) {
-  const triggers = confidenceResult.riskSignals || [];
+  const riskSignals = confidenceResult.riskSignals || [];
+  const requiresEscalation = Boolean(confidenceResult.requiresEscalation);
 
-  if (
-    triggers.includes("unsafe_input_detected") ||
-    confidenceResult.decision === "unsafe_input_detected"
-  ) {
-    const ticketId = `CG-SAFE-${Math.floor(100000 + Math.random() * 900000)}`;
+  const highPrioritySignals = [
+    "angry_customer",
+    "abusive_or_rude_language",
+    "customer_requested_human_support",
+    "payment_risk",
+    "fulfillment_risk",
+    "unsafe_request",
+  ];
 
+  const hasHighPriority = riskSignals.some((signal) =>
+    highPrioritySignals.includes(signal)
+  );
+
+  if (!requiresEscalation && !hasHighPriority) {
     return {
-      ticketRequired: true,
-      ticketId,
-      priority: "LOW",
-      assignedTeam: "Safety Review",
-      sla: "2 business days",
-      title: "[LOW] Safety review required",
-      reason: "Unsafe or policy-bypass input was detected and safely refused.",
-      reasons: [
-        {
-          trigger: "unsafe_input_detected",
-          reason:
-            "Customer message attempted to bypass support rules or access restricted behavior.",
-        },
-      ],
-      escalationTriggers: ["unsafe_input_detected"],
-      customerMessage: `This request was safely refused and marked for safety review. Ticket ID: ${ticketId}.`,
-      internalNotes: {
-        createdAt: new Date().toISOString(),
-      },
-    };
-  }
-
-  if (
-    triggers.includes("customer_requested_human_support") ||
-    confidenceResult.decision === "customer_requested_human_support"
-  ) {
-    const ticketId = `CG-HUM-${Math.floor(100000 + Math.random() * 900000)}`;
-
-    return {
-      ticketRequired: true,
-      ticketId,
-      priority: "MEDIUM",
-      assignedTeam: "General Support",
-      sla: "1 business day",
-      title: "[MEDIUM] Human support requested",
-      reason: "Customer requested a human support agent.",
-      reasons: [
-        {
-          trigger: "customer_requested_human_support",
-          reason: "Customer explicitly asked to speak with human support.",
-        },
-      ],
-      escalationTriggers: ["customer_requested_human_support"],
-      customerMessage: `Your request has been marked for human support review. Expected review time: 1 business day. Ticket ID: ${ticketId}.`,
-      internalNotes: {
-        createdAt: new Date().toISOString(),
-      },
-    };
-  }
-
-  if (triggers.includes("angry_customer")) {
-    const ticketId = `CG-ANG-${Math.floor(100000 + Math.random() * 900000)}`;
-
-    return {
-      ticketRequired: true,
-      ticketId,
-      priority: "MEDIUM",
-      assignedTeam: "Customer Experience",
-      sla: "1 business day",
-      title: "[MEDIUM] Customer sentiment review required",
-      reason: "Customer tone indicates frustration or dissatisfaction.",
-      reasons: [
-        {
-          trigger: "angry_customer",
-          reason:
-            "Customer appears frustrated and may need careful support handling.",
-        },
-      ],
-      escalationTriggers: ["angry_customer"],
-      customerMessage: `I’ve marked this for careful support review. Expected review time: 1 business day. Ticket ID: ${ticketId}.`,
-      internalNotes: {
-        createdAt: new Date().toISOString(),
-      },
+      ticketRequired: false,
     };
   }
 
   return {
-    ticketRequired: false,
+    ticketRequired: true,
+    ticketId: null,
+    priority: hasHighPriority ? "HIGH" : "MEDIUM",
+    assignedTeam: hasHighPriority
+      ? "Customer Support Escalation Team"
+      : "General Support",
+    sla: hasHighPriority ? "4 business hours" : "1 business day",
+    reason:
+      confidenceResult.reason ||
+      "Fallback/escalation required due to low confidence or customer risk signal.",
+    escalationTriggers: riskSignals,
   };
 }
+
+// =====================================================
+// COMPATIBILITY ALIASES
+// =====================================================
+
+function handleFallback(
+  confidenceResult = {},
+  intentResult = {},
+  sessionState = {}
+) {
+  return generateFallbackResponse(
+    confidenceResult,
+    intentResult,
+    sessionState
+  );
+}
+
+function fallbackResponse(
+  confidenceResult = {},
+  intentResult = {},
+  sessionState = {}
+) {
+  return generateFallbackResponse(
+    confidenceResult,
+    intentResult,
+    sessionState
+  );
+}
+
+// =====================================================
+// EXPORTS
+// =====================================================
 
 module.exports = {
   generateFallbackResponse,
   buildFallbackEscalation,
   isGreetingQuery,
-  isConversationEndQuery,
 
-  _internal: {
-    normalizeText,
-    includesAny,
-    getIntentFriendlyName,
-    getOrderIdText,
-    buildResponse,
-    getPolicyMessage,
-  },
+  handleFallback,
+  fallbackResponse,
+
+  normalizeText,
+  normalizeForMatching,
+  includesAny,
 };

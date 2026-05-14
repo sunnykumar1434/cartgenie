@@ -1,429 +1,486 @@
-// escalationAgent.js
+"use strict";
 
-// ===============================
-// PRIORITY LOGIC
-// ===============================
+/**
+ * escalationAgent.js
+ *
+ * Handles support escalation decisions for CartGenie.
+ *
+ * Used by app.js:
+ * const { handleEscalation } = require("./escalationAgent");
+ *
+ * Main goals:
+ * - Generate clean escalation metadata.
+ * - Escalate risky cases: human support, payment issue, lost shipment,
+ *   angry customer, damaged/wrong/missing item, unclear manual review.
+ * - Avoid duplicate/confusing escalation messages.
+ * - Keep demo-safe behavior for presentation.
+ */
 
-function getPriorityFromTriggers(triggers = []) {
-  if (
-    triggers.includes("very_high_value_order") ||
-    triggers.includes("pan_verification_required") ||
-    triggers.includes("prompt_injection_detected") ||
-    triggers.includes("unsafe_input_detected")
-  ) {
-    return "CRITICAL";
+// =====================================================
+// HELPERS
+// =====================================================
+
+function normalizeText(value = "") {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+}
+
+function normalizeLooseText(value = "") {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function safeString(value, fallback = null) {
+  if (value === undefined || value === null) return fallback;
+  const clean = String(value).trim();
+  return clean || fallback;
+}
+
+function getOrderId(ruleResult = {}) {
+  return (
+    safeString(ruleResult.orderId) ||
+    safeString(ruleResult.order?.orderId) ||
+    null
+  );
+}
+
+function getIntent(ruleResult = {}) {
+  return safeString(ruleResult.intent, "general_support");
+}
+
+function getIssueType(ruleResult = {}) {
+  return safeString(ruleResult.issueType, "general");
+}
+
+function getDecision(ruleResult = {}) {
+  return safeString(ruleResult.decision, "unknown");
+}
+
+function getStatus(ruleResult = {}) {
+  return (
+    safeString(ruleResult.status) ||
+    safeString(ruleResult.orderStatus) ||
+    safeString(ruleResult.order?.status) ||
+    "UNKNOWN"
+  );
+}
+
+function generateTicketId(prefix = "CG") {
+  const timePart = Date.now().toString(36).toUpperCase();
+  const randomPart = Math.floor(100000 + Math.random() * 900000);
+  return `${prefix}-${timePart}-${randomPart}`;
+}
+
+function uniqueArray(values = []) {
+  return Array.from(
+    new Set(
+      values
+        .filter(Boolean)
+        .map((value) => String(value).trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function includesAny(text = "", patterns = []) {
+  const clean = normalizeLooseText(text);
+
+  return patterns.some((pattern) =>
+    clean.includes(normalizeLooseText(pattern))
+  );
+}
+
+// =====================================================
+// PRIORITY / TEAM LOGIC
+// =====================================================
+
+function detectTriggers(ruleResult = {}, context = {}) {
+  const intent = getIntent(ruleResult);
+  const issueType = getIssueType(ruleResult);
+  const decision = getDecision(ruleResult);
+  const status = normalizeText(getStatus(ruleResult));
+  const query = context.query || "";
+
+  const existingTriggers = ruleResult.escalationTriggers || [];
+  const triggers = [...existingTriggers];
+
+  if (ruleResult.requiresEscalation) {
+    triggers.push("rule_engine_escalation_required");
+  }
+
+  if (intent === "human_support") {
+    triggers.push("customer_requested_human_support");
   }
 
   if (
-    triggers.includes("payment_conflict") ||
-    triggers.includes("refund_dispute") ||
-    triggers.includes("smartphone_doa_claim") ||
-    triggers.includes("fraud_risk") ||
-    triggers.includes("angry_customer") ||
-    triggers.includes("abusive_customer") ||
-    triggers.includes("customer_requested_human_support")
+    includesAny(query, [
+      "connect me to human",
+      "human support",
+      "human agent",
+      "talk to human",
+      "real person",
+      "customer care",
+      "raise ticket",
+      "create ticket",
+      "escalate",
+    ])
   ) {
+    triggers.push("customer_requested_human_support");
+  }
+
+  if (
+    intent === "payment_issue" ||
+    issueType === "payment" ||
+    issueType === "charged_twice" ||
+    issueType === "payment_deducted_order_not_created" ||
+    includesAny(query, [
+      "charged twice",
+      "double charged",
+      "money deducted",
+      "amount deducted",
+      "paid but order not placed",
+      "payment successful but order not placed",
+    ])
+  ) {
+    triggers.push("payment_issue");
+  }
+
+  if (
+    intent === "missing_item" ||
+    issueType === "missing_item" ||
+    includesAny(query, ["missing item", "item missing", "product missing"])
+  ) {
+    triggers.push("missing_item");
+  }
+
+  if (
+    intent === "wrong_item" ||
+    issueType === "wrong_item" ||
+    includesAny(query, ["wrong item", "wrong product", "different product"])
+  ) {
+    triggers.push("wrong_item");
+  }
+
+  if (
+    intent === "damaged_item" ||
+    issueType === "damaged_item" ||
+    includesAny(query, ["damaged", "broken", "defective", "not working"])
+  ) {
+    triggers.push("damaged_item");
+  }
+
+  if (
+    decision.includes("lost") ||
+    status.includes("lost") ||
+    includesAny(query, ["lost in transit", "lost order"])
+  ) {
+    triggers.push("lost_in_transit");
+  }
+
+  if (
+    decision.includes("delay") ||
+    status.includes("delayed") ||
+    includesAny(query, ["delayed", "late delivery", "delay"])
+  ) {
+    triggers.push("delivery_delay");
+  }
+
+  if (
+    decision.includes("manual_review") ||
+    decision.includes("support_review") ||
+    status.includes("manual_review")
+  ) {
+    triggers.push("manual_review_required");
+  }
+
+  if (
+    context.customerTone === "angry" ||
+    includesAny(query, [
+      "angry",
+      "frustrated",
+      "upset",
+      "dumb",
+      "stupid",
+      "shit",
+      "useless",
+      "get lost",
+    ])
+  ) {
+    triggers.push("angry_customer");
+  }
+
+  if (
+    includesAny(query, [
+      "ignore previous instructions",
+      "bypass policy",
+      "admin access",
+      "delete logs",
+      "system prompt",
+      "api key",
+      "secret",
+    ])
+  ) {
+    triggers.push("unsafe_request");
+  }
+
+  return uniqueArray(triggers);
+}
+
+function getPriority(triggers = [], ruleResult = {}, context = {}) {
+  const highPriorityTriggers = [
+    "payment_issue",
+    "lost_in_transit",
+    "missing_item",
+    "wrong_item",
+    "damaged_item",
+    "angry_customer",
+    "unsafe_request",
+    "customer_requested_human_support",
+  ];
+
+  if (triggers.some((trigger) => highPriorityTriggers.includes(trigger))) {
     return "HIGH";
   }
 
   if (
-    triggers.includes("brand_verification_required") ||
-    triggers.includes("unboxing_proof_required") ||
-    triggers.includes("high_value_order") ||
-    triggers.includes("missing_product_claim") ||
-    triggers.includes("wrong_product_claim") ||
-    triggers.includes("policy_conflict") ||
-    triggers.includes("order_status_unclear") ||
-    triggers.includes("repeated_low_confidence")
+    triggers.includes("delivery_delay") ||
+    triggers.includes("manual_review_required")
   ) {
     return "MEDIUM";
   }
 
-  return "LOW";
+  if (ruleResult.priority) return ruleResult.priority;
+
+  if (context.customerTone === "angry") return "HIGH";
+
+  return "MEDIUM";
 }
 
-// ===============================
-// TEAM ASSIGNMENT LOGIC
-// ===============================
-
-function getAssignedTeam(triggers = [], intent, decision) {
-  if (
-    triggers.includes("prompt_injection_detected") ||
-    triggers.includes("unsafe_input_detected") ||
-    triggers.includes("fraud_risk")
-  ) {
-    return "Safety Review Team";
-  }
+function getAssignedTeam(triggers = [], ruleResult = {}) {
+  const intent = getIntent(ruleResult);
+  const issueType = getIssueType(ruleResult);
 
   if (
-    triggers.includes("payment_conflict") ||
-    triggers.includes("refund_dispute") ||
+    triggers.includes("payment_issue") ||
     intent === "payment_issue" ||
-    intent === "refund_status" ||
-    decision === "payment_issue_escalate" ||
-    decision === "refund_discrepancy_escalate"
+    issueType.includes("payment")
   ) {
-    return "Payments Support";
+    return "Payments Support Team";
   }
 
   if (
-    triggers.includes("smartphone_doa_claim") ||
-    triggers.includes("brand_verification_required") ||
-    triggers.includes("unboxing_proof_required") ||
-    decision === "replacement_requires_doa_certificate" ||
-    decision === "replacement_requires_brand_verification" ||
-    decision === "replacement_requires_unboxing_proof"
+    triggers.includes("lost_in_transit") ||
+    triggers.includes("delivery_delay")
   ) {
-    return "Replacement Verification Team";
+    return "Logistics Support Team";
   }
 
   if (
-    triggers.includes("very_high_value_order") ||
-    triggers.includes("pan_verification_required")
+    triggers.includes("missing_item") ||
+    triggers.includes("wrong_item") ||
+    triggers.includes("damaged_item")
   ) {
-    return "Risk Review Team";
+    return "Returns & Quality Support Team";
   }
 
   if (
     triggers.includes("angry_customer") ||
-    triggers.includes("abusive_customer") ||
-    triggers.includes("customer_requested_human_support") ||
-    triggers.includes("repeated_low_confidence")
+    triggers.includes("customer_requested_human_support")
   ) {
     return "Customer Support Escalation Team";
   }
 
-  if (
-    intent === "delivery_issue" ||
-    decision === "delivery_failed_escalate" ||
-    decision === "lost_in_transit_escalate"
-  ) {
-    return "Logistics Support";
-  }
-
-  if (
-    intent === "return_order" ||
-    decision === "return_requires_escalation" ||
-    decision === "return_blocked_quality_check_failed"
-  ) {
-    return "Returns Support";
+  if (triggers.includes("unsafe_request")) {
+    return "Trust & Safety Review";
   }
 
   return "General Support";
 }
 
-// ===============================
-// SLA LOGIC
-// ===============================
-
-function getSLA(priority) {
-  switch (priority) {
-    case "CRITICAL":
-      return "1 business hour";
-
-    case "HIGH":
-      return "4 business hours";
-
-    case "MEDIUM":
-      return "1 business day";
-
-    case "LOW":
-      return "2 business days";
-
-    default:
-      return "2 business days";
-  }
-}
-
-// ===============================
-// ESCALATION REASON MAPPING
-// ===============================
-
-function getEscalationReason(trigger) {
-  const reasonMap = {
-    very_high_value_order:
-      "Very high-value order requires additional verification.",
-    high_value_order:
-      "High-value order requires additional verification.",
-    pan_verification_required:
-      "PAN verification is required for this order.",
-
-    payment_conflict:
-      "Payment conflict or payment mismatch detected.",
-    refund_dispute:
-      "Refund dispute or refund mismatch detected.",
-
-    smartphone_doa_claim:
-      "Smartphone dead-on-arrival claim requires specialist verification.",
-    brand_verification_required:
-      "Brand or service-center verification is required.",
-    unboxing_proof_required:
-      "Unboxing proof is required before approval.",
-
-    fraud_risk:
-      "Fraud risk signal detected.",
-    prompt_injection_detected:
-      "Unsafe prompt-injection or policy-bypass attempt detected.",
-    unsafe_input_detected:
-      "Unsafe instruction pattern detected.",
-
-    angry_customer:
-      "Customer sentiment indicates anger or dissatisfaction.",
-    abusive_customer:
-      "Abusive or unsafe customer language detected.",
-
-    missing_product_claim:
-      "Missing product claim requires manual review.",
-    wrong_product_claim:
-      "Wrong product claim requires manual review.",
-
-    policy_conflict:
-      "Policy conflict requires human review.",
-    order_status_unclear:
-      "Order status is unclear for automatic decision.",
-
-    repeated_low_confidence:
-      "Repeated unclear or unresolved requests require human support.",
-    customer_requested_human_support:
-      "Customer explicitly requested human support."
-  };
-
-  return reasonMap[trigger] || "Manual review is required.";
-}
-
-// ===============================
-// SAFE SUPPRESSION LOGIC
-// Prevent over-escalation for normal informational flows.
-// ===============================
-
-function isInformationalDecision(ruleResult = {}) {
-  const informationalDecisions = [
-    "order_delivered",
-    "order_in_transit",
-    "order_shipped",
-    "order_placed",
-    "order_confirmed",
-    "order_out_for_delivery",
-    "order_not_dispatched",
-    "tracking_info_available",
-    "delivery_policy_info",
-    "refund_policy_info",
-    "return_policy_info",
-    "replacement_policy_info",
-    "cancellation_policy_info"
-  ];
-
-  return informationalDecisions.includes(ruleResult.decision);
-}
-
-function hasOnlySoftRiskTriggers(triggers = []) {
-  if (!Array.isArray(triggers) || triggers.length === 0) return true;
-
-  const hardTriggers = [
-    "payment_conflict",
-    "refund_dispute",
-    "smartphone_doa_claim",
-    "brand_verification_required",
-    "unboxing_proof_required",
-    "fraud_risk",
-    "prompt_injection_detected",
-    "unsafe_input_detected",
-    "angry_customer",
-    "abusive_customer",
-    "missing_product_claim",
-    "wrong_product_claim",
-    "policy_conflict",
-    "order_status_unclear",
-    "repeated_low_confidence",
-    "customer_requested_human_support",
-    "very_high_value_order",
-    "pan_verification_required"
-  ];
-
-  return !triggers.some((trigger) => hardTriggers.includes(trigger));
-}
-
-function shouldSuppressEscalation(ruleResult = {}) {
-  const triggers = ruleResult.escalationTriggers || [];
-
-  // Normal tracking or delivered-status responses should not create tickets
-  // only because the order value is high.
-  if (
-    ruleResult.intent === "track_order" &&
-    isInformationalDecision(ruleResult) &&
-    hasOnlySoftRiskTriggers(triggers)
-  ) {
-    return true;
+function getSla(priority = "MEDIUM", triggers = []) {
+  if (triggers.includes("unsafe_request")) {
+    return "Immediate review";
   }
 
-  // Approved informational decisions should not escalate unless a hard risk exists.
-  if (
-    ruleResult.allowed === true &&
-    isInformationalDecision(ruleResult) &&
-    hasOnlySoftRiskTriggers(triggers)
-  ) {
-    return true;
+  if (priority === "HIGH") {
+    return "4 business hours";
+  }
+
+  if (priority === "MEDIUM") {
+    return "1 business day";
+  }
+
+  return "2 business days";
+}
+
+function getReason(triggers = [], ruleResult = {}, context = {}) {
+  const orderId = getOrderId(ruleResult);
+  const orderText = orderId ? ` for order ${orderId}` : "";
+
+  if (triggers.includes("customer_requested_human_support")) {
+    return `Customer requested human support${orderText}.`;
+  }
+
+  if (triggers.includes("payment_issue")) {
+    return `Payment issue requires secure support review${orderText}.`;
+  }
+
+  if (triggers.includes("lost_in_transit")) {
+    return `Shipment may be lost in transit and needs logistics review${orderText}.`;
+  }
+
+  if (triggers.includes("delivery_delay")) {
+    return `Delivery appears delayed and may need logistics follow-up${orderText}.`;
+  }
+
+  if (triggers.includes("missing_item")) {
+    return `Missing item issue needs support validation${orderText}.`;
+  }
+
+  if (triggers.includes("wrong_item")) {
+    return `Wrong item issue needs support validation${orderText}.`;
+  }
+
+  if (triggers.includes("damaged_item")) {
+    return `Damaged/defective item issue needs support validation${orderText}.`;
+  }
+
+  if (triggers.includes("angry_customer")) {
+    return `Customer appears frustrated and should be handled carefully${orderText}.`;
+  }
+
+  if (triggers.includes("unsafe_request")) {
+    return "Unsafe or policy-bypass request detected.";
+  }
+
+  if (triggers.includes("manual_review_required")) {
+    return `Manual support review is required${orderText}.`;
+  }
+
+  return (
+    ruleResult.reason ||
+    `Support review may be required${orderText}.`
+  );
+}
+
+function shouldEscalate(ruleResult = {}, context = {}) {
+  const triggers = detectTriggers(ruleResult, context);
+
+  if (ruleResult.requiresEscalation) return true;
+
+  if (triggers.length > 0) {
+    const strongTriggers = [
+      "customer_requested_human_support",
+      "payment_issue",
+      "lost_in_transit",
+      "missing_item",
+      "wrong_item",
+      "damaged_item",
+      "angry_customer",
+      "unsafe_request",
+      "manual_review_required",
+    ];
+
+    return triggers.some((trigger) => strongTriggers.includes(trigger));
   }
 
   return false;
 }
 
-// ===============================
-// TICKET HELPERS
-// ===============================
-
-function buildTicketTitle(ruleResult, priority, assignedTeam) {
-  const orderId = ruleResult.orderId || "UNKNOWN_ORDER";
-  const decision = ruleResult.decision || "unknown_decision";
-
-  return `[${priority}] ${assignedTeam} review required for ${orderId} - ${decision}`;
-}
-
-function buildCustomerEscalationMessage(ticket) {
-  if (!ticket.ticketRequired) {
-    return "";
-  }
-
-  return `Your case has been escalated to ${ticket.assignedTeam}. Priority: ${ticket.priority}. Expected review time: ${ticket.sla}. Ticket ID: ${ticket.ticketId}.`;
-}
-
-function generateTicketId(orderId) {
-  const randomPart = Math.floor(100000 + Math.random() * 900000);
-  const cleanOrderId = orderId || "NOORDER";
-  return `CG-${cleanOrderId}-${randomPart}`;
-}
-
-// ===============================
-// MAIN ESCALATION DECISION
-// ===============================
-
-function shouldEscalate(ruleResult) {
-  if (!ruleResult) return false;
-
-  if (shouldSuppressEscalation(ruleResult)) {
-    return false;
-  }
-
-  if (ruleResult.requiresEscalation === true) {
-    return true;
-  }
-
-  const escalationDecisions = [
-    "payment_issue_escalate",
-    "refund_discrepancy_escalate",
-
-    "replacement_requires_doa_certificate",
-    "replacement_requires_brand_verification",
-    "replacement_requires_unboxing_proof",
-    "replacement_requires_escalation",
-
-    "delivery_failed_escalate",
-    "lost_in_transit_escalate",
-
-    "cancel_requires_escalation",
-    "return_requires_escalation",
-    "return_blocked_quality_check_failed",
-
-    "unsafe_input_detected",
-    "prompt_injection_detected",
-    "customer_requested_human_support",
-    "repeated_low_confidence"
-  ];
-
-  return escalationDecisions.includes(ruleResult.decision);
-}
-
-// ===============================
+// =====================================================
 // MAIN HANDLER
-// ===============================
+// =====================================================
 
-function handleEscalation(ruleResult, context = {}) {
-  if (!shouldEscalate(ruleResult)) {
+function handleEscalation(ruleResult = {}, context = {}) {
+  const triggers = detectTriggers(ruleResult, context);
+  const escalationRequired = shouldEscalate(ruleResult, context);
+
+  if (!escalationRequired) {
     return {
       ticketRequired: false,
       ticketId: null,
-      priority: null,
       assignedTeam: null,
+      priority: null,
       sla: null,
-      title: null,
-      reasons: [],
-      customerMessage: "",
-      internalNotes: "No escalation required.",
-      escalationTriggers: ruleResult?.escalationTriggers || []
+      reason: null,
+      escalationTriggers: [],
     };
   }
 
-  const triggers = [...new Set(ruleResult.escalationTriggers || [])];
+  const priority = getPriority(triggers, ruleResult, context);
+  const assignedTeam = getAssignedTeam(triggers, ruleResult);
+  const sla = getSla(priority, triggers);
+  const reason = getReason(triggers, ruleResult, context);
 
-  const priority = getPriorityFromTriggers(triggers);
-  const assignedTeam = getAssignedTeam(
-    triggers,
-    ruleResult.intent,
-    ruleResult.decision
-  );
-  const sla = getSLA(priority);
-  const ticketId = generateTicketId(ruleResult.orderId);
+  const ticketPrefix =
+    assignedTeam === "Payments Support Team"
+      ? "CG-PAY"
+      : assignedTeam === "Logistics Support Team"
+      ? "CG-LOG"
+      : assignedTeam === "Returns & Quality Support Team"
+      ? "CG-RQA"
+      : assignedTeam === "Trust & Safety Review"
+      ? "CG-SAFE"
+      : "CG-SUP";
 
-  const reasons =
-    triggers.length > 0
-      ? triggers.map((trigger) => ({
-          trigger,
-          reason: getEscalationReason(trigger)
-        }))
-      : [
-          {
-            trigger: "manual_review",
-            reason: "Manual review is required for this decision."
-          }
-        ];
-
-  const ticket = {
+  return {
     ticketRequired: true,
-    ticketId,
-    priority,
+    ticketId: generateTicketId(ticketPrefix),
     assignedTeam,
+    priority,
     sla,
-    title: buildTicketTitle(ruleResult, priority, assignedTeam),
-
-    orderId: ruleResult.orderId || null,
-    intent: ruleResult.intent || null,
-    decision: ruleResult.decision || null,
-
-    allowedByPolicy: ruleResult.allowed,
-    refundRequired: ruleResult.refundRequired || false,
-    nextAction: ruleResult.nextAction || null,
-
-    reasons,
+    reason,
     escalationTriggers: triggers,
-
-    customerMessage: "",
-
-    internalNotes: {
-      rawReason: ruleResult.reason || null,
-      customerTone: context.customerTone || "neutral",
-      query: context.query || null,
-      source: context.source || "cartgenie_backend",
-      createdAt: new Date().toISOString()
-    }
   };
+}
 
-  ticket.customerMessage = buildCustomerEscalationMessage(ticket);
+// =====================================================
+// CUSTOMER MESSAGE HELPER
+// =====================================================
 
-  return ticket;
+function buildEscalationCustomerMessage(escalation = {}, ruleResult = {}) {
+  if (!escalation || !escalation.ticketRequired) {
+    return null;
+  }
+
+  const orderId = getOrderId(ruleResult);
+  const orderText = orderId ? ` for order ${orderId}` : "";
+
+  return `I’ll mark this${orderText} for ${escalation.assignedTeam} review. Ticket ID: ${escalation.ticketId}. Expected SLA: ${escalation.sla}.`;
+}
+
+// =====================================================
+// COMPATIBILITY ALIASES
+// =====================================================
+
+function createEscalation(ruleResult = {}, context = {}) {
+  return handleEscalation(ruleResult, context);
+}
+
+function evaluateEscalation(ruleResult = {}, context = {}) {
+  return handleEscalation(ruleResult, context);
+}
+
+function escalationAgent(ruleResult = {}, context = {}) {
+  return handleEscalation(ruleResult, context);
 }
 
 module.exports = {
   handleEscalation,
+  createEscalation,
+  evaluateEscalation,
+  escalationAgent,
 
-  _internal: {
-    getPriorityFromTriggers,
-    getAssignedTeam,
-    getSLA,
-    getEscalationReason,
-    shouldEscalate,
-    shouldSuppressEscalation,
-    isInformationalDecision,
-    hasOnlySoftRiskTriggers,
-    generateTicketId
-  }
+  buildEscalationCustomerMessage,
+
+  detectTriggers,
+  shouldEscalate,
+  getPriority,
+  getAssignedTeam,
+  getSla,
+  getReason,
 };

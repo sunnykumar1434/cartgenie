@@ -1,449 +1,462 @@
-// confidenceAgent.js
-// Decides whether the detected intent should go to:
-// Rule Engine, Clarification, Fallback, Context Resolution, or Escalation.
+"use strict";
 
-const HIGH_CONFIDENCE_THRESHOLD = 0.75;
-const LOW_CONFIDENCE_THRESHOLD = 0.5;
+/**
+ * confidenceAgent.js
+ *
+ * Purpose:
+ * - Decide whether a query should go to rule engine, clarification, fallback, or escalation.
+ * - Keep deterministic ecommerce flows stable.
+ * - Do NOT block valid order intents like reorder_order or trackingId-only tracking.
+ * - Detect risk/customer sentiment signals for escalation priority.
+ */
 
-const ORDER_REQUIRED_INTENTS = [
+const DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.5;
+const DEFAULT_RULE_ENGINE_THRESHOLD = 0.65;
+
+const ORDER_REQUIRED_INTENTS = new Set([
+  "track_order",
   "cancel_order",
   "return_order",
   "replace_order",
-  "refund_status",
   "exchange_order",
-  "track_order",
+  "reorder_order",
+  "refund_status",
+  "payment_issue",
   "delivery_issue",
+  "missing_item",
+  "wrong_item",
+  "damaged_item",
+]);
+
+const DIRECT_INFO_INTENTS = new Set([
+  "greeting",
+  "conversation_end",
+  "context_reset",
+  "order_id_help",
+  "trust_question",
+  "tone_feedback",
+  "context_complaint",
+  "customer_frustration",
+  "abusive_user",
+  "rude_user",
+  "human_support",
+  "negative_correction",
+  "unsafe_request",
+  "off_topic",
+]);
+
+const ESCALATION_INTENTS = new Set([
+  "human_support",
   "payment_issue",
   "missing_item",
   "wrong_item",
   "damaged_item",
-];
+]);
 
-const POLICY_INTENTS = [
-  "delivery_policy",
-  "refund_policy",
-  "return_policy",
-  "replacement_policy",
-  "cancellation_policy",
-];
-
-const DIRECT_INFO_INTENTS = [
-  "order_id_faq",
-  "bulk_cancel_help",
-  "account_or_subscription_help",
-];
-
-const SAFE_NON_ORDER_INTENTS = [
-  "greeting",
-  "non_commerce_request",
+const FALLBACK_SAFE_INTENTS = new Set([
   "general_support",
-  ...POLICY_INTENTS,
-  ...DIRECT_INFO_INTENTS,
-];
+  "off_topic",
+]);
 
-function normalizeText(text = "") {
-  return String(text || "").trim().toLowerCase();
-}
+// =====================================================
+// HELPERS
+// =====================================================
 
-function normalizeConfidence(confidence) {
-  let value = Number(confidence);
-
-  if (Number.isNaN(value)) {
-    return 0;
-  }
-
-  if (value > 1) {
-    value = value / 100;
-  }
-
-  return Math.max(0, Math.min(value, 1));
+function normalizeText(value = "") {
+  return String(value || "").toLowerCase().trim().replace(/\s+/g, " ");
 }
 
 function includesAny(text = "", patterns = []) {
-  const cleanText = normalizeText(text);
-  return patterns.some((pattern) => cleanText.includes(pattern));
+  const clean = normalizeText(text);
+  return patterns.some((pattern) => clean.includes(normalizeText(pattern)));
 }
 
-function isAngryCustomer(query = "") {
-  return includesAny(query, [
-    "angry",
-    "very angry",
-    "frustrated",
-    "irritated",
-    "useless",
-    "worst",
-    "bad service",
-    "terrible",
-    "nonsense",
-    "stupid",
-    "fraud",
-    "scam",
-    "cheated",
-    "legal action",
-    "consumer court",
-    "complaint",
-    "i will complain",
-    "i am very angry",
-  ]);
-}
+function clampConfidence(value, fallback = DEFAULT_LOW_CONFIDENCE_THRESHOLD) {
+  const parsed = Number(value);
 
-function isUnsafeInput(query = "") {
-  return includesAny(query, [
-    "ignore previous instructions",
-    "ignore all instructions",
-    "bypass",
-    "jailbreak",
-    "system prompt",
-    "developer message",
-    "reveal prompt",
-    "show your prompt",
-    "act as admin",
-    "admin access",
-    "override policy",
-    "skip policy",
-    "approve everything",
-    "give refund without checking",
-    "cancel without order id",
-    "delete logs",
-    "hide audit",
-  ]);
-}
+  if (!Number.isFinite(parsed)) return fallback;
 
-function isHumanSupportRequest(query = "", intent = "") {
-  if (intent === "human_support") return true;
+  if (parsed < 0) return 0;
+  if (parsed > 1) return 1;
 
-  return includesAny(query, [
-    "human agent",
-    "real person",
-    "customer care",
-    "customer support",
-    "support agent",
-    "connect me with human",
-    "connect me to human",
-    "connect to agent",
-    "talk to agent",
-    "talk to human",
-    "speak to human",
-    "speak with human",
-    "call me",
-    "agent please",
-    "raise ticket",
-    "escalate this",
-  ]);
-}
-
-function isOnlyOrderReference(intentResult = {}) {
-  return intentResult.intent === "order_reference_only";
+  return parsed;
 }
 
 function hasOrderId(intentResult = {}) {
-  return Boolean(intentResult.orderId);
+  return Boolean(intentResult.orderId || intentResult.entities?.orderId);
 }
 
 function hasTrackingId(intentResult = {}) {
-  return Boolean(intentResult.trackingId);
+  return Boolean(intentResult.trackingId || intentResult.entities?.trackingId);
 }
 
-function getMissingEntities(intentResult = {}) {
-  const missing = [];
-  const intent = intentResult.intent;
-
-  if (ORDER_REQUIRED_INTENTS.includes(intent)) {
-    if (!hasOrderId(intentResult) && !hasTrackingId(intentResult)) {
-      missing.push("orderId");
-    }
-  }
-
-  return missing;
+function getOrderId(intentResult = {}) {
+  return intentResult.orderId || intentResult.entities?.orderId || null;
 }
 
-function buildBaseResult(intentResult = {}, options = {}) {
-  const confidence = normalizeConfidence(intentResult.confidence);
-
-  return {
-    originalConfidence: intentResult.confidence ?? null,
-    normalizedConfidence: confidence,
-    highThreshold: HIGH_CONFIDENCE_THRESHOLD,
-    lowThreshold: LOW_CONFIDENCE_THRESHOLD,
-
-    intent: intentResult.intent || "general_support",
-    route: null,
-    decision: null,
-
-    allowedToUseRuleEngine: false,
-    requiresFallback: false,
-    requiresClarification: false,
-    requiresEscalation: false,
-
-    missingEntities: [],
-    riskSignals: [],
-
-    reason: null,
-
-    metadata: {
-      orderId: intentResult.orderId || null,
-      trackingId: intentResult.trackingId || null,
-      issueType: intentResult.issueType || "general",
-      source: intentResult.source || null,
-      query: options.query || null,
-    },
-  };
+function getTrackingId(intentResult = {}) {
+  return intentResult.trackingId || intentResult.entities?.trackingId || null;
 }
 
-function addRiskSignal(result, signal) {
-  if (!result.riskSignals.includes(signal)) {
-    result.riskSignals.push(signal);
-  }
+function normalizeIntent(intentResult = {}) {
+  return String(intentResult.intent || "general_support").trim();
 }
 
-function evaluateConfidence(intentResult = {}, options = {}) {
-  const query = options.query || intentResult.rawText || "";
-  const intent = intentResult.intent || "general_support";
-  const confidence = normalizeConfidence(intentResult.confidence);
-  const result = buildBaseResult(intentResult, options);
+function detectRiskSignals(intentResult = {}, context = {}) {
+  const query = normalizeText(context.query || intentResult.rawText || "");
+  const metadataSignals = intentResult.metadata?.riskSignals || [];
 
-  // ===============================
-  // Safety and human-support priority
-  // ===============================
+  const riskSignals = new Set(metadataSignals);
 
-  if (isUnsafeInput(query) || intent === "unsafe_request") {
-    addRiskSignal(result, "unsafe_input_detected");
-
-    result.route = "fallback_llm";
-    result.decision = "unsafe_input_detected";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = true;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason =
-      "Unsafe or policy-bypass input detected. The request should not be processed by the rule engine.";
-
-    return result;
-  }
-
-  if (isHumanSupportRequest(query, intent)) {
-    addRiskSignal(result, "customer_requested_human_support");
-
-    result.route = "human_support";
-    result.decision = "customer_requested_human_support";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = false;
-    result.requiresClarification = false;
-    result.requiresEscalation = true;
-    result.reason = "Customer explicitly requested human support.";
-
-    return result;
-  }
-
-  if (isAngryCustomer(query)) {
-    addRiskSignal(result, "angry_customer");
-  }
-
-  // ===============================
-  // Greeting / Direct Info / Policy / Off-topic
-  // ===============================
-
-  if (intent === "greeting") {
-    result.route = "fallback_llm";
-    result.decision = "greeting_detected";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = true;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason = "Greeting detected. Respond politely without rule engine.";
-
-    return result;
-  }
-
-  if (DIRECT_INFO_INTENTS.includes(intent)) {
-    result.route = "direct_info";
-    result.decision = intent;
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = false;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason = "Direct FAQ/help intent detected.";
-
-    return result;
-  }
-
-  if (POLICY_INTENTS.includes(intent)) {
-    result.route = "fallback_llm";
-    result.decision = "general_policy_query";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = true;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason =
-      "General policy query detected. It can be answered without order-level rules.";
-
-    return result;
-  }
-
-  if (intent === "non_commerce_request") {
-    result.route = "fallback_llm";
-    result.decision = "non_commerce_request";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = true;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason =
-      "The query is outside order support, so it should be redirected politely.";
-
-    return result;
-  }
-
-  // ===============================
-  // Context-only order reference
-  // ===============================
-
-  if (isOnlyOrderReference(intentResult)) {
-    result.route = "context_resolution";
-    result.decision = "order_reference_only";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = false;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason =
-      "Only an order ID was shared. The app context resolver should attach the pending or previous intent.";
-
-    return result;
-  }
-
-  // ===============================
-  // Missing entity handling
-  // ===============================
-
-  const missingEntities = getMissingEntities(intentResult);
-  result.missingEntities = missingEntities;
-
-  if (missingEntities.length > 0) {
-    result.route = "clarification";
-    result.decision = "missing_required_entity";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = false;
-    result.requiresClarification = true;
-    result.requiresEscalation = false;
-    result.reason =
-      "The intent is order-specific, but the required order ID or tracking ID is missing.";
-
-    return result;
-  }
-
-  // ===============================
-  // Low confidence handling
-  // ===============================
-
-  if (confidence < LOW_CONFIDENCE_THRESHOLD) {
-    result.route = "fallback_llm";
-    result.decision = "low_confidence";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = true;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason =
-      "Intent confidence is low, so the bot should respond carefully and ask for clarification if needed.";
-
-    return result;
+  if (
+    includesAny(query, [
+      "angry",
+      "frustrated",
+      "upset",
+      "annoyed",
+      "irritated",
+      "bad experience",
+      "not happy",
+    ])
+  ) {
+    riskSignals.add("angry_customer");
   }
 
   if (
-    confidence >= LOW_CONFIDENCE_THRESHOLD &&
-    confidence < HIGH_CONFIDENCE_THRESHOLD
+    includesAny(query, [
+      "dumb",
+      "stupid",
+      "idiot",
+      "shit",
+      "bullshit",
+      "useless",
+      "trash",
+      "get lost",
+      "shut up",
+    ])
   ) {
-    // For safe general-support queries, a polite clarification is better than escalation.
-    if (SAFE_NON_ORDER_INTENTS.includes(intent) || intent === "general_support") {
-      result.route = "fallback_llm";
-      result.decision = "medium_confidence_general_support";
-      result.allowedToUseRuleEngine = false;
-      result.requiresFallback = true;
-      result.requiresClarification = false;
-      result.requiresEscalation = false;
-      result.reason =
-        "Medium confidence general query. Use a polite fallback/help response.";
+    riskSignals.add("abusive_or_rude_language");
+    riskSignals.add("angry_customer");
+  }
 
-      return result;
+  if (
+    includesAny(query, [
+      "connect me to human",
+      "human support",
+      "human agent",
+      "talk to human",
+      "real person",
+      "raise ticket",
+      "create ticket",
+      "escalate",
+    ])
+  ) {
+    riskSignals.add("customer_requested_human_support");
+  }
+
+  if (
+    includesAny(query, [
+      "charged twice",
+      "double charged",
+      "money deducted",
+      "amount deducted",
+      "paid but order not placed",
+      "payment successful but order not placed",
+    ])
+  ) {
+    riskSignals.add("payment_risk");
+  }
+
+  if (
+    includesAny(query, [
+      "lost in transit",
+      "lost order",
+      "not delivered",
+      "missing item",
+      "wrong item",
+      "damaged",
+      "broken",
+    ])
+  ) {
+    riskSignals.add("fulfillment_risk");
+  }
+
+  if (
+    includesAny(query, [
+      "ignore previous instructions",
+      "bypass policy",
+      "admin access",
+      "delete logs",
+      "system prompt",
+      "api key",
+      "secret",
+      "jailbreak",
+    ])
+  ) {
+    riskSignals.add("unsafe_request");
+  }
+
+  return Array.from(riskSignals);
+}
+
+function buildResult({
+  route,
+  decision,
+  confidence,
+  requiresClarification = false,
+  requiresFallback = false,
+  requiresEscalation = false,
+  missingEntities = [],
+  riskSignals = [],
+  reason = null,
+}) {
+  return {
+    route,
+    decision,
+    confidence: clampConfidence(confidence),
+    requiresClarification,
+    requiresFallback,
+    requiresEscalation,
+    missingEntities,
+    riskSignals,
+    reason,
+  };
+}
+
+// =====================================================
+// MAIN EVALUATOR
+// =====================================================
+
+function evaluateConfidence(intentResult = {}, context = {}) {
+  const intent = normalizeIntent(intentResult);
+  const confidence = clampConfidence(intentResult.confidence, 0.5);
+  const query = context.query || intentResult.rawText || "";
+
+  const orderId = getOrderId(intentResult);
+  const trackingId = getTrackingId(intentResult);
+
+  const orderPresent = hasOrderId(intentResult);
+  const trackingPresent = hasTrackingId(intentResult);
+
+  const riskSignals = detectRiskSignals(intentResult, {
+    ...context,
+    query,
+  });
+
+  const hasHighRisk = riskSignals.some((signal) =>
+    [
+      "angry_customer",
+      "abusive_or_rude_language",
+      "customer_requested_human_support",
+      "payment_risk",
+      "fulfillment_risk",
+      "unsafe_request",
+    ].includes(signal)
+  );
+
+  // -----------------------------------------------------
+  // 1. Safety / unsafe requests
+  // -----------------------------------------------------
+  if (intent === "unsafe_request" || riskSignals.includes("unsafe_request")) {
+    return buildResult({
+      route: "direct_info",
+      decision: "unsafe_request_blocked",
+      confidence,
+      requiresEscalation: false,
+      riskSignals,
+      reason: "Unsafe or policy-bypass request detected.",
+    });
+  }
+
+  // -----------------------------------------------------
+  // 2. Direct conversational/meta intents
+  // -----------------------------------------------------
+  if (DIRECT_INFO_INTENTS.has(intent)) {
+    return buildResult({
+      route: "direct_info",
+      decision: "direct_conversation_response",
+      confidence,
+      requiresEscalation:
+        intent === "human_support" ||
+        intent === "customer_frustration" ||
+        intent === "abusive_user" ||
+        intent === "rude_user",
+      riskSignals,
+      reason: "Direct non-rule-engine conversational intent.",
+    });
+  }
+
+  // -----------------------------------------------------
+  // 3. Tracking ID alone is enough for tracking
+  // -----------------------------------------------------
+  if (intent === "track_order" && trackingPresent) {
+    return buildResult({
+      route: "rule_engine",
+      decision: "tracking_id_present",
+      confidence: Math.max(confidence, 0.92),
+      requiresClarification: false,
+      requiresFallback: false,
+      requiresEscalation: hasHighRisk,
+      riskSignals,
+      reason: "Tracking ID can resolve the order.",
+    });
+  }
+
+  // -----------------------------------------------------
+  // 4. Order-required intents missing order ID
+  // -----------------------------------------------------
+  if (ORDER_REQUIRED_INTENTS.has(intent) && !orderPresent && !trackingPresent) {
+    return buildResult({
+      route: "clarification",
+      decision: "missing_required_entity",
+      confidence,
+      requiresClarification: true,
+      requiresFallback: false,
+      requiresEscalation: false,
+      missingEntities: ["orderId"],
+      riskSignals,
+      reason: "Order-specific intent requires order ID or tracking ID.",
+    });
+  }
+
+  // -----------------------------------------------------
+  // 5. Order-required intents with order ID should go to rule engine
+  // -----------------------------------------------------
+  if (ORDER_REQUIRED_INTENTS.has(intent) && (orderPresent || trackingPresent)) {
+    return buildResult({
+      route: "rule_engine",
+      decision: "order_entity_present",
+      confidence: Math.max(confidence, 0.82),
+      requiresClarification: false,
+      requiresFallback: false,
+      requiresEscalation:
+        hasHighRisk || ESCALATION_INTENTS.has(intent),
+      riskSignals,
+      reason: "Order entity present for order-specific intent.",
+    });
+  }
+
+  // -----------------------------------------------------
+  // 6. Order reference only should ask what action user wants
+  // -----------------------------------------------------
+  if (intent === "order_reference_only") {
+    if (orderPresent || trackingPresent) {
+      return buildResult({
+        route: "direct_info",
+        decision: "order_reference_needs_action",
+        confidence,
+        requiresClarification: true,
+        requiresFallback: false,
+        requiresEscalation: false,
+        missingEntities: ["intent"],
+        riskSignals,
+        reason: "Only order reference was provided; action is missing.",
+      });
     }
 
-    result.route = "clarification";
-    result.decision = "medium_confidence_needs_clarification";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = false;
-    result.requiresClarification = true;
-    result.requiresEscalation = false;
-    result.reason =
-      "Intent confidence is medium, so clarification is safer before applying rules.";
-
-    return result;
+    return buildResult({
+      route: "clarification",
+      decision: "missing_required_entity",
+      confidence,
+      requiresClarification: true,
+      missingEntities: ["orderId", "intent"],
+      riskSignals,
+      reason: "Order reference intent without usable order ID.",
+    });
   }
 
-  // ===============================
-  // High-confidence order intents
-  // ===============================
-
-  if (ORDER_REQUIRED_INTENTS.includes(intent)) {
-    result.route = "rule_engine";
-    result.decision = "high_confidence_order_intent";
-    result.allowedToUseRuleEngine = true;
-    result.requiresFallback = false;
-    result.requiresClarification = false;
-    result.requiresEscalation = result.riskSignals.includes("angry_customer");
-    result.reason =
-      "High-confidence order intent with required entity present. Safe to use rule engine.";
-
-    return result;
+  // -----------------------------------------------------
+  // 7. Low confidence generic fallback
+  // -----------------------------------------------------
+  if (confidence < DEFAULT_LOW_CONFIDENCE_THRESHOLD) {
+    return buildResult({
+      route: "fallback_llm",
+      decision: "low_confidence",
+      confidence,
+      requiresFallback: true,
+      requiresEscalation: false,
+      riskSignals,
+      reason: "Low confidence intent classification.",
+    });
   }
 
-  // ===============================
-  // General support
-  // ===============================
+  // -----------------------------------------------------
+  // 8. General support / off-topic
+  // -----------------------------------------------------
+  if (FALLBACK_SAFE_INTENTS.has(intent)) {
+    if (intent === "off_topic") {
+      return buildResult({
+        route: "direct_info",
+        decision: "off_topic_redirect",
+        confidence,
+        requiresFallback: false,
+        requiresEscalation: false,
+        riskSignals,
+        reason: "Off-topic query should be redirected politely.",
+      });
+    }
 
-  if (intent === "general_support") {
-    result.route = "fallback_llm";
-    result.decision = "general_support";
-    result.allowedToUseRuleEngine = false;
-    result.requiresFallback = true;
-    result.requiresClarification = false;
-    result.requiresEscalation = false;
-    result.reason =
-      "General support query detected. Respond politely with supported options.";
-
-    return result;
+    return buildResult({
+      route: "fallback_llm",
+      decision: "general_support_needs_clarification",
+      confidence,
+      requiresFallback: true,
+      requiresEscalation: false,
+      riskSignals,
+      reason: "General query needs clarification.",
+    });
   }
 
-  // ===============================
-  // Unknown but confident
-  // ===============================
+  // -----------------------------------------------------
+  // 9. Medium confidence known intent
+  // -----------------------------------------------------
+  if (confidence >= DEFAULT_RULE_ENGINE_THRESHOLD) {
+    return buildResult({
+      route: "rule_engine",
+      decision: "sufficient_confidence",
+      confidence,
+      requiresClarification: false,
+      requiresFallback: false,
+      requiresEscalation: hasHighRisk,
+      riskSignals,
+      reason: "Confidence is sufficient for rule engine.",
+    });
+  }
 
-  result.route = "fallback_llm";
-  result.decision = "unsupported_or_unclear_intent";
-  result.allowedToUseRuleEngine = false;
-  result.requiresFallback = true;
-  result.requiresClarification = false;
-  result.requiresEscalation = false;
-  result.reason =
-    "The intent is not supported by the current rule engine. Use polite fallback instead of harsh failure.";
+  // -----------------------------------------------------
+  // 10. Default fallback
+  // -----------------------------------------------------
+  return buildResult({
+    route: "fallback_llm",
+    decision: "default_fallback",
+    confidence,
+    requiresFallback: true,
+    requiresEscalation: hasHighRisk,
+    riskSignals,
+    reason: "Default fallback route.",
+  });
+}
 
-  return result;
+// =====================================================
+// COMPATIBILITY HELPERS
+// =====================================================
+
+function analyzeConfidence(intentResult = {}, context = {}) {
+  return evaluateConfidence(intentResult, context);
+}
+
+function getConfidenceDecision(intentResult = {}, context = {}) {
+  return evaluateConfidence(intentResult, context);
 }
 
 module.exports = {
   evaluateConfidence,
+  analyzeConfidence,
+  getConfidenceDecision,
 
-  _internal: {
-    HIGH_CONFIDENCE_THRESHOLD,
-    LOW_CONFIDENCE_THRESHOLD,
-    ORDER_REQUIRED_INTENTS,
-    POLICY_INTENTS,
-    DIRECT_INFO_INTENTS,
-    SAFE_NON_ORDER_INTENTS,
-    normalizeText,
-    normalizeConfidence,
-    includesAny,
-    isAngryCustomer,
-    isUnsafeInput,
-    isHumanSupportRequest,
-    getMissingEntities,
-    buildBaseResult,
-  },
+  clampConfidence,
+  detectRiskSignals,
+
+  ORDER_REQUIRED_INTENTS,
+  DIRECT_INFO_INTENTS,
 };

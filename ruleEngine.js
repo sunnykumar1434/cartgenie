@@ -1,1571 +1,1226 @@
-const rules = require("./rules.json");
+"use strict";
 
-// ===============================
-// BASIC HELPERS
-// ===============================
+/**
+ * ruleEngine.js
+ *
+ * CartGenie deterministic business rule engine.
+ *
+ * Responsibilities:
+ * - Validate order-based intents using order status + policy fields.
+ * - Keep eligibility checks separate from action execution.
+ * - Return structured decisions for responseAgent.
+ * - Support:
+ *   track/status by order ID or tracking ID
+ *   cancel eligibility + confirmation requirement
+ *   return/replacement/exchange eligibility
+ *   refund/payment escalation
+ *   reorder status-aware guidance
+ *   delivery/lost/delayed handling
+ */
 
-function normalize(value = "") {
-  return String(value || "").trim().toLowerCase();
+const CANCELLABLE_STATUSES = new Set([
+  "placed",
+  "confirmed",
+  "processing",
+  "pending",
+]);
+
+const ACTIVE_NOT_DELIVERED_STATUSES = new Set([
+  "placed",
+  "confirmed",
+  "processing",
+  "packed",
+  "ready_to_ship",
+  "shipped",
+  "in_transit",
+  "out_for_delivery",
+]);
+
+const SHIPPED_STATUSES = new Set([
+  "shipped",
+  "in_transit",
+]);
+
+const DELIVERED_STATUSES = new Set([
+  "delivered",
+  "completed",
+]);
+
+const TERMINAL_CANCELLED_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+]);
+
+const RETURNED_OR_REFUNDED_STATUSES = new Set([
+  "returned",
+  "return_completed",
+  "refunded",
+  "refund_completed",
+]);
+
+const DELAYED_STATUSES = new Set([
+  "delayed",
+  "delivery_delayed",
+]);
+
+const LOST_STATUSES = new Set([
+  "lost",
+  "lost_in_transit",
+]);
+
+const OUT_FOR_DELIVERY_STATUSES = new Set([
+  "out_for_delivery",
+  "ofd",
+]);
+
+const RETURN_WINDOW_DAYS = 7;
+const EXCHANGE_WINDOW_DAYS = 7;
+const REPLACEMENT_WINDOW_DAYS = 7;
+
+// =====================================================
+// HELPERS
+// =====================================================
+
+function normalizeText(value = "") {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, "_");
 }
 
-function normalizeStatus(status = "") {
-  const s = normalize(status);
-
-  const aliases = {
-    canceled: "cancelled",
-    packed: "processing",
-    rto: "returned_to_origin",
-    return_to_origin: "returned_to_origin",
-    returned_origin: "returned_to_origin",
-    ofd: "out_for_delivery",
-    delivered_success: "delivered",
-  };
-
-  return aliases[s] || s;
+function normalizeLooseText(value = "") {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function normalizePaymentStatus(status = "") {
-  const s = normalize(status);
+function toBool(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value === undefined || value === null) return fallback;
 
-  const aliases = {
-    success: "paid",
-    successful: "paid",
-    completed: "paid",
-    captured: "paid",
-    deducted: "payment_pending_but_debited",
-    deducted_but_failed: "payment_pending_but_debited",
-    pending_but_debited: "payment_pending_but_debited",
-  };
+  const clean = normalizeLooseText(value);
 
-  return aliases[s] || s;
+  if (["true", "yes", "y", "1", "allowed", "eligible"].includes(clean)) {
+    return true;
+  }
+
+  if (["false", "no", "n", "0", "blocked", "not eligible"].includes(clean)) {
+    return false;
+  }
+
+  return fallback;
 }
 
-function normalizePaymentMethod(method = "") {
-  const m = normalize(method);
-
-  const aliases = {
-    credit_card: "card",
-    debit_card: "card",
-    cards: "card",
-    cash_on_delivery: "cod",
-    cash: "cod",
-    paylater: "pay_later",
-    net_banking: "netbanking",
-  };
-
-  return aliases[m] || m;
+function getOrderId(order) {
+  return order?.orderId || order?.id || null;
 }
 
-function getOrderValue(order = {}) {
-  return Number(order.orderValue || order.amount || order.value || 0);
-}
-
-function isPrepaid(order = {}) {
-  return ["upi", "card", "netbanking", "wallet", "pay_later", "emi"].includes(
-    normalizePaymentMethod(order.paymentMethod || order.paymentMode)
-  );
-}
-
-function isPaid(order = {}) {
-  return ["paid", "success"].includes(
-    normalizePaymentStatus(order.paymentStatus)
-  );
-}
-
-function hasPaymentConflict(order = {}) {
-  const paymentStatuses = rules.payment?.paymentConflictStatuses || [
-    "failed",
-    "double_charged",
-    "refund_failed",
-    "refund_not_received",
-    "payment_pending_but_debited",
-  ];
-
-  return paymentStatuses.includes(normalizePaymentStatus(order.paymentStatus));
-}
-
-function isHighValue(order = {}) {
+function getTrackingId(order) {
   return (
-    getOrderValue(order) >= Number(rules.thresholds?.highValueOrder || 50000)
+    order?.trackingId ||
+    order?.awb ||
+    order?.shipmentId ||
+    order?.courierTrackingId ||
+    null
   );
 }
 
-function isVeryHighValue(order = {}) {
-  return (
-    getOrderValue(order) >=
-    Number(rules.thresholds?.veryHighValueOrder || 200000)
-  );
+function getStatus(order) {
+  return normalizeText(order?.status || order?.orderStatus || "unknown");
 }
 
-function isInsideWindow(daysAgo, windowDays) {
-  if (typeof daysAgo !== "number") return false;
-  return daysAgo <= Number(windowDays || 0);
+function getDisplayStatus(order) {
+  const raw = order?.status || order?.orderStatus || "Unknown";
+  return String(raw)
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function createResult({
-  intent,
-  order,
-  decision,
-  allowed,
-  reason,
-  refundRequired = false,
-  requiresEscalation = false,
-  escalationTriggers = [],
-  nextAction = null,
-  extra = {},
-}) {
+function getPaymentMethod(order) {
+  return normalizeText(order?.paymentMethod || order?.paymentMode || "");
+}
+
+function getPaymentStatus(order) {
+  return normalizeText(order?.paymentStatus || "");
+}
+
+function isPrepaid(order) {
+  const method = getPaymentMethod(order);
+  const paymentStatus = getPaymentStatus(order);
+
+  if (
+    ["paid", "successful", "success", "captured"].includes(paymentStatus)
+  ) {
+    return true;
+  }
+
+  return [
+    "upi",
+    "card",
+    "credit_card",
+    "debit_card",
+    "netbanking",
+    "wallet",
+    "pay_later",
+    "emi",
+  ].includes(method);
+}
+
+function getDeliveryDaysAgo(order) {
+  const raw =
+    order?.deliveryDaysAgo ??
+    order?.daysSinceDelivery ??
+    order?.deliveredDaysAgo ??
+    null;
+
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isWithinWindow(daysAgo, windowDays) {
+  if (daysAgo === null || daysAgo === undefined) return true;
+  return Number(daysAgo) <= windowDays;
+}
+
+function isDelivered(order) {
+  return DELIVERED_STATUSES.has(getStatus(order));
+}
+
+function isCancelled(order) {
+  return TERMINAL_CANCELLED_STATUSES.has(getStatus(order));
+}
+
+function isReturnedOrRefunded(order) {
+  return RETURNED_OR_REFUNDED_STATUSES.has(getStatus(order));
+}
+
+function isCancellable(order) {
+  return CANCELLABLE_STATUSES.has(getStatus(order));
+}
+
+function isActiveNotDelivered(order) {
+  return ACTIVE_NOT_DELIVERED_STATUSES.has(getStatus(order));
+}
+
+function isShipped(order) {
+  return SHIPPED_STATUSES.has(getStatus(order));
+}
+
+function isOutForDelivery(order) {
+  return OUT_FOR_DELIVERY_STATUSES.has(getStatus(order));
+}
+
+function isDelayed(order) {
+  return DELAYED_STATUSES.has(getStatus(order));
+}
+
+function isLost(order) {
+  return LOST_STATUSES.has(getStatus(order));
+}
+
+function buildBaseResult({ intent, order, issueType = "general" }) {
   return {
     intent,
-    orderId: order ? order.orderId : null,
-    decision,
-    allowed,
-    reason,
-    refundRequired,
-    requiresEscalation,
-    escalationTriggers: [...new Set(escalationTriggers || [])],
-    nextAction,
-    ...extra,
-  };
-}
+    issueType,
 
-function shouldApplyValueEscalation(intent, decision) {
-  const informationalDecisions = [
-    "order_delivered",
-    "order_in_transit",
-    "order_shipped",
-    "order_placed",
-    "order_confirmed",
-    "order_out_for_delivery",
-    "order_not_dispatched",
-    "order_not_dispatched_yet",
-    "tracking_available",
-    "tracking_info_available",
-    "delivery_policy_info",
-    "refund_policy_info",
-    "return_policy_info",
-    "replacement_policy_info",
-    "cancellation_policy_info",
-    "refund_not_started",
-    "refund_completed",
-    "refund_initiated",
-  ];
+    order,
+    orderId: getOrderId(order),
+    trackingId: getTrackingId(order),
+    orderStatus: getStatus(order),
+    displayStatus: getDisplayStatus(order),
 
-  if (intent === "track_order" && informationalDecisions.includes(decision)) {
-    return false;
-  }
+    allowed: false,
+    decision: "unknown",
+    status: "UNKNOWN",
 
-  if (
-    intent === "refund_status" &&
-    ["refund_not_started", "refund_completed", "refund_initiated"].includes(
-      decision
-    )
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function applyCommonEscalation(result, order) {
-  if (!order || !result) return result;
-
-  result.escalationTriggers = result.escalationTriggers || [];
-
-  if (shouldApplyValueEscalation(result.intent, result.decision)) {
-    if (isVeryHighValue(order)) {
-      result.requiresEscalation = true;
-      result.escalationTriggers.push("very_high_value_order");
-    } else if (isHighValue(order)) {
-      result.requiresEscalation = true;
-      result.escalationTriggers.push("high_value_order");
-    }
-  }
-
-  if (hasPaymentConflict(order)) {
-    result.requiresEscalation = true;
-    result.escalationTriggers.push("payment_conflict");
-  }
-
-  if (order.fraudRisk === true || order.isHighRiskUser === true) {
-    result.requiresEscalation = true;
-    result.escalationTriggers.push("fraud_risk");
-  }
-
-  if (
-    typeof order.repeatedFailures === "number" &&
-    order.repeatedFailures >= Number(rules.thresholds?.maxRepeatedFailures || 3)
-  ) {
-    result.requiresEscalation = true;
-    result.escalationTriggers.push("repeated_low_confidence");
-  }
-
-  result.escalationTriggers = [...new Set(result.escalationTriggers)];
-
-  return result;
-}
-
-// ===============================
-// POLICY / NON-ORDER INTENTS
-// ===============================
-
-function evaluatePolicyInfo(intent) {
-  const policy = rules.policyInfo || {};
-
-  const policyMap = {
-    delivery_policy: {
-      decision: "delivery_policy_info",
-      reason:
-        policy.delivery_policy?.message ||
-        "Most orders are delivered within 3-7 business days depending on product type, seller, courier partner, and delivery location. Please share your order ID for exact tracking.",
-      nextAction: "ask_order_id_for_exact_tracking",
-    },
-    refund_policy: {
-      decision: "refund_policy_info",
-      reason:
-        policy.refund_policy?.message ||
-        "Refunds are usually processed after cancellation confirmation or after return pickup, receiving, and quality check. Refunds generally go to the original payment source.",
-      nextAction: "ask_order_id_for_refund_status",
-    },
-    return_policy: {
-      decision: "return_policy_info",
-      reason:
-        policy.return_policy?.message ||
-        "Returns depend on product category, return window, item condition, pickup eligibility, and quality check. Please share your order ID to check exact eligibility.",
-      nextAction: "ask_order_id_for_return_eligibility",
-    },
-    replacement_policy: {
-      decision: "replacement_policy_info",
-      reason:
-        policy.replacement_policy?.message ||
-        "Replacement may be available for damaged, defective, wrong, missing, incomplete, technical issue, or dead-on-arrival cases within the allowed replacement window.",
-      nextAction: "ask_order_id_for_replacement_eligibility",
-    },
-    cancellation_policy: {
-      decision: "cancellation_policy_info",
-      reason:
-        policy.cancellation_policy?.message ||
-        "Cancellation is usually allowed before dispatch or shipment. Once shipped, out for delivery, or delivered, cancellation is no longer available automatically.",
-      nextAction: "ask_order_id_for_cancellation_eligibility",
-    },
-  };
-
-  const data = policyMap[intent];
-
-  if (!data) {
-    return createResult({
-      intent,
-      order: null,
-      decision: "policy_info_unavailable",
-      allowed: false,
-      reason:
-        "I can help with order policies, but I need a little more detail to guide you correctly.",
-      nextAction: "ask_clarifying_question",
-    });
-  }
-
-  return createResult({
-    intent,
-    order: null,
-    decision: data.decision,
-    allowed: true,
-    reason: data.reason,
     refundRequired: false,
     requiresEscalation: false,
     escalationTriggers: [],
-    nextAction: data.nextAction,
-  });
+
+    nextAction: null,
+    reason: null,
+    policy: null,
+
+    courierPartner: order?.courierPartner || order?.courier || null,
+    currentLocation:
+      order?.currentLocation ||
+      order?.lastKnownLocation ||
+      order?.location ||
+      order?.hub ||
+      null,
+    estimatedDelivery:
+      order?.estimatedDelivery ||
+      order?.eta ||
+      order?.expectedDelivery ||
+      null,
+    lastTrackingUpdate:
+      order?.lastTrackingUpdate ||
+      order?.lastUpdated ||
+      order?.trackingUpdatedAt ||
+      null,
+    trackingUrl:
+      order?.trackingUrl ||
+      order?.trackingLink ||
+      null,
+    shipmentStatusNote:
+      order?.shipmentStatusNote ||
+      order?.statusNote ||
+      null,
+  };
 }
 
-function evaluateNonCommerceRequest() {
-  return createResult({
-    intent: "non_commerce_request",
+function orderNotFound(intent, issueType = "general") {
+  return {
+    intent,
+    issueType,
     order: null,
-    decision: "non_commerce_request",
+    orderId: null,
+    trackingId: null,
+    orderStatus: null,
+    displayStatus: null,
+
     allowed: false,
-    reason:
-      "This request is outside order support. CartGenie can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues.",
+    decision: "order_not_found",
+    status: "ORDER_NOT_FOUND",
+
+    refundRequired: false,
     requiresEscalation: false,
     escalationTriggers: [],
-    nextAction: "redirect_to_order_support",
-  });
-}
 
-function evaluateGreeting() {
-  return createResult({
-    intent: "greeting",
-    order: null,
-    decision: "greeting_detected",
-    allowed: true,
+    nextAction: "ask_valid_order_id",
     reason:
-      "Hi, welcome to CartGenie AI. I can help with tracking, cancellation, returns, refunds, replacement, exchange, delivery, and payment issues.",
-    requiresEscalation: false,
-    escalationTriggers: [],
-    nextAction: "ask_customer_support_need",
-  });
+      "Order was not found in the available demo records.",
+    policy: null,
+  };
 }
 
-function evaluateUnsafeRequest() {
-  return createResult({
-    intent: "unsafe_request",
-    order: null,
-    decision: "unsafe_input_detected",
-    allowed: false,
-    reason:
-      "Unsafe or policy-bypass instruction pattern detected. This request cannot be processed automatically.",
-    requiresEscalation: true,
-    escalationTriggers: ["unsafe_input_detected"],
-    nextAction: "safety_review",
-  });
+function addEscalation(result, trigger, priority = "MEDIUM") {
+  result.requiresEscalation = true;
+  result.escalationTriggers = Array.from(
+    new Set([...(result.escalationTriggers || []), trigger])
+  );
+  result.priority = result.priority || priority;
+  return result;
 }
 
-function evaluateHumanSupport(order = null) {
-  return createResult({
-    intent: "human_support",
+// =====================================================
+// TRACKING / STATUS
+// =====================================================
+
+function evaluateTracking(order, issueType = "tracking") {
+  if (!order) return orderNotFound("track_order", issueType);
+
+  const result = buildBaseResult({
+    intent: "track_order",
     order,
-    decision: "customer_requested_human_support",
-    allowed: true,
-    reason: "Customer requested human support.",
-    requiresEscalation: true,
-    escalationTriggers: ["customer_requested_human_support"],
-    nextAction: "create_human_support_ticket",
+    issueType,
   });
-}
 
-// ===============================
-// CANCELLATION
-// ===============================
+  const status = getStatus(order);
+  const trackingId = getTrackingId(order);
 
-function evaluateCancellation(order) {
-  const status = normalizeStatus(order.status);
-  const decisionCodes = rules.cancellation?.decisionCodes || {};
-
-  const allowedStatuses = rules.cancellation?.allowedStatuses || [
-    "placed",
-    "confirmed",
-    "processing",
-  ];
-
-  if (allowedStatuses.includes(status)) {
-    const refundRequired = isPrepaid(order) && isPaid(order);
-
-    return applyCommonEscalation(
-      createResult({
-        intent: "cancel_order",
-        order,
-        decision: refundRequired
-          ? decisionCodes.allowedWithRefund || "cancel_allowed_refund_initiated"
-          : decisionCodes.allowed || "cancel_allowed",
-        allowed: true,
-        reason: refundRequired
-          ? "Order is eligible for cancellation. Since it is prepaid, refund should be initiated to the original payment source."
-          : "Order is eligible for cancellation because it has not been dispatched yet.",
-        refundRequired,
-        nextAction: refundRequired
-          ? "cancel_order_and_initiate_refund"
-          : "cancel_order",
-      }),
-      order
-    );
-  }
-
-  if (status === "dispatched") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "cancel_order",
-        order,
-        decision: decisionCodes.blockedDispatched || "cancel_blocked_dispatched",
-        allowed: false,
-        reason:
-          "Order has already been dispatched, so direct cancellation is not available at this stage.",
-        nextAction: "suggest_reject_at_doorstep_or_return_if_eligible",
-      }),
-      order
-    );
-  }
-
-  if (status === "shipped") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "cancel_order",
-        order,
-        decision: decisionCodes.blockedShipped || "cancel_blocked_shipped",
-        allowed: false,
-        reason:
-          "Order has already been shipped, so direct cancellation is not available at this stage.",
-        nextAction: "suggest_reject_at_doorstep_or_return_if_eligible",
-      }),
-      order
-    );
-  }
-
-  if (status === "out_for_delivery") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "cancel_order",
-        order,
-        decision:
-          decisionCodes.blockedOutForDelivery ||
-          "cancel_blocked_out_for_delivery",
-        allowed: false,
-        reason:
-          "Order is already out for delivery, so direct cancellation is not available now.",
-        nextAction: "suggest_reject_at_doorstep",
-      }),
-      order
-    );
-  }
-
-  if (status === "delivered") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "cancel_order",
-        order,
-        decision: decisionCodes.blockedDelivered || "cancel_blocked_delivered",
-        allowed: false,
-        reason:
-          "Order has already been delivered, so cancellation is not possible now. Return or replacement can be checked if the product is eligible.",
-        nextAction: "suggest_return_or_replacement_if_eligible",
-      }),
-      order
-    );
-  }
-
-  if (status === "cancelled") {
-    return createResult({
-      intent: "cancel_order",
-      order,
-      decision: decisionCodes.alreadyCancelled || "cancel_already_done",
+  if (isCancelled(order)) {
+    return {
+      ...result,
       allowed: false,
-      reason: "This order is already cancelled.",
-      nextAction: "check_refund_status_if_prepaid",
-    });
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "cancel_order",
-      order,
-      decision: decisionCodes.requiresEscalation || "cancel_requires_escalation",
-      allowed: false,
+      decision: "tracking_cancelled_order",
+      status: "CANCELLED",
+      nextAction: "no_tracking_cancelled_order",
       reason:
-        "Cancellation needs manual review because the current order status is not clear enough for automatic cancellation.",
-      requiresEscalation: true,
-      escalationTriggers: ["order_status_unclear"],
-      nextAction: "human_review",
-    }),
-    order
-  );
-}
-
-// ===============================
-// RETURN
-// ===============================
-
-function evaluateReturn(order) {
-  const status = normalizeStatus(order.status);
-  const category = normalize(order.category);
-  const issueType = normalize(order.issueType || "general");
-  const decisionCodes = rules.return?.decisionCodes || {};
-
-  if (status !== "delivered") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "return_order",
-        order,
-        decision:
-          decisionCodes.blockedNotDelivered || "return_blocked_not_delivered",
-        allowed: false,
-        reason:
-          "Return can be checked only after the order is delivered. This order is not delivered yet.",
-        nextAction: "wait_until_delivery",
-      }),
-      order
-    );
+        "The order is cancelled, so tracking is not available.",
+    };
   }
 
-  const blockedCategories = rules.return?.blockedCategories || [];
-  const exceptionIssues =
-    rules.return?.returnOnlyForIssueCategories
-      ?.non_returnable_exception_issues || [
-      "damaged_product",
-      "wrong_product",
-      "missing_item",
-      "incomplete_product",
-      "expired_product",
-    ];
-
-  const isBlockedCategory =
-    blockedCategories.includes(category) || order.returnable === false;
-
-  if (isBlockedCategory && !exceptionIssues.includes(issueType)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "return_order",
-        order,
-        decision:
-          decisionCodes.blockedNonReturnable || "return_blocked_non_returnable",
-        allowed: false,
-        reason:
-          "This product category is not eligible for normal return as per the current policy.",
-        nextAction: "check_replacement_if_damaged_wrong_or_defective",
-      }),
-      order
-    );
-  }
-
-  const windowDays =
-    order.returnWindowDays ||
-    rules.return?.categoryReturnWindows?.[category] ||
-    rules.return?.defaultReturnWindowDays ||
-    7;
-
-  if (!isInsideWindow(order.deliveryDaysAgo, windowDays)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "return_order",
-        order,
-        decision:
-          decisionCodes.blockedWindowExpired || "return_blocked_window_expired",
-        allowed: false,
-        reason: `Return window has expired. This product had a return window of ${windowDays} days.`,
-        nextAction: "escalate_only_if_exception_claim",
-      }),
-      order
-    );
-  }
-
-  if (order.qualityCheckPassed === false) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "return_order",
-        order,
-        decision:
-          decisionCodes.blockedQualityCheckFailed ||
-          "return_blocked_quality_check_failed",
-        allowed: false,
-        reason: "Return needs manual review because quality check failed.",
-        requiresEscalation: true,
-        escalationTriggers: ["policy_conflict"],
-        nextAction: "manual_quality_check_review",
-      }),
-      order
-    );
-  }
-
-  const conditionFailures = [];
-
-  if (order.correctProduct === false) conditionFailures.push("wrong_product");
-  if (order.completeProduct === false)
-    conditionFailures.push("incomplete_product");
-  if (order.unusedProduct === false) conditionFailures.push("used_product");
-  if (order.undamagedProduct === false)
-    conditionFailures.push("damaged_product");
-  if (order.originalPackaging === false)
-    conditionFailures.push("missing_packaging");
-  if (order.tagsIntact === false) conditionFailures.push("tags_missing");
-  if (order.accessoriesPresent === false)
-    conditionFailures.push("missing_accessories");
-  if (order.isAlteredProduct === true)
-    conditionFailures.push("altered_product");
-
-  if (conditionFailures.length > 0) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "return_order",
-        order,
-        decision:
-          decisionCodes.qualityCheckRequired || "return_quality_check_required",
-        allowed: false,
-        reason:
-          "Return needs manual quality-check review because some return conditions are not fully satisfied.",
-        requiresEscalation: true,
-        escalationTriggers: ["policy_conflict"],
-        nextAction: "manual_quality_check_review",
-        extra: {
-          conditionFailures,
-        },
-      }),
-      order
-    );
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "return_order",
-      order,
-      decision: decisionCodes.allowed || "return_allowed",
+  if (isReturnedOrRefunded(order)) {
+    return {
+      ...result,
       allowed: true,
+      decision: "tracking_returned_or_refunded",
+      status: "RETURNED_OR_REFUNDED",
+      nextAction: "show_terminal_status",
       reason:
-        "Product is eligible for return. Pickup and quality check may be required before refund processing.",
-      refundRequired: true,
-      nextAction: "create_return_request_and_schedule_pickup",
-    }),
-    order
-  );
-}
-
-// ===============================
-// REPLACEMENT / DAMAGED / WRONG / MISSING
-// ===============================
-
-function resolveReplacementIssueType(order = {}, inputIssueType = "general") {
-  const input = normalize(inputIssueType);
-  const orderIssue = normalize(order.issueType || "general");
-
-  if (!input || input === "general") {
-    return orderIssue || "general";
+        "The order is already returned/refunded.",
+    };
   }
 
-  return input;
-}
-
-function evaluateReplacement(order, inputIssueType = "general") {
-  const status = normalizeStatus(order.status);
-  const category = normalize(order.category);
-  const issueType = resolveReplacementIssueType(order, inputIssueType);
-  const decisionCodes = rules.replacement?.decisionCodes || {};
-
-  const allowedIssueTypes = rules.replacement?.allowedIssueTypes || [
-    "defective_product",
-    "damaged_product",
-    "wrong_product",
-    "missing_item",
-    "incomplete_product",
-    "technical_issue",
-    "dead_on_arrival",
-  ];
-
-  if (status !== "delivered") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision: "replacement_blocked_not_delivered",
+  if (isLost(order)) {
+    return addEscalation(
+      {
+        ...result,
         allowed: false,
+        decision: "tracking_lost_in_transit",
+        status: "LOST_IN_TRANSIT",
+        nextAction: "support_review_required",
         reason:
-          "Replacement can be checked only after the order is delivered.",
-        nextAction: "wait_until_delivery",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  if (order.replacementEligible === false) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.blockedIssueNotEligible ||
-          "replacement_blocked_issue_not_eligible",
-        allowed: false,
-        reason:
-          "This product is not eligible for automatic replacement under the current product policy.",
-        nextAction: "human_review_if_customer_disputes",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  if (!allowedIssueTypes.includes(issueType)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.blockedIssueNotEligible ||
-          "replacement_blocked_issue_not_eligible",
-        allowed: false,
-        reason:
-          "Based on the selected issue type, this product is not eligible for automatic replacement as per policy.",
-        nextAction: "ask_customer_for_issue_details",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  if (
-    rules.replacement?.onlyOneReplacementAllowed === true &&
-    Number(order.replacementCount || 0) >= 1
-  ) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.blockedAlreadyReplaced ||
-          "replacement_blocked_already_replaced",
-        allowed: false,
-        reason:
-          "Only one replacement is allowed for this product, and a replacement has already been used.",
-        nextAction: "human_review_if_customer_disputes",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  const windowDays =
-    order.replacementWindowDays ||
-    rules.replacement?.categoryReplacementWindows?.[category] ||
-    rules.replacement?.defaultReplacementWindowDays ||
-    7;
-
-  if (!isInsideWindow(order.deliveryDaysAgo, windowDays)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.blockedWindowExpired ||
-          "replacement_blocked_window_expired",
-        allowed: false,
-        reason: `Replacement window has expired. This product had a replacement window of ${windowDays} days.`,
-        nextAction: "brand_service_or_human_review",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  const escalationTriggers = [];
-
-  if (["wrong_product", "missing_item"].includes(issueType)) {
-    escalationTriggers.push(
-      issueType === "wrong_product"
-        ? "wrong_product_claim"
-        : "missing_product_claim"
-    );
-  }
-
-  if (
-    issueType === "dead_on_arrival" &&
-    (rules.replacement?.requiresDOACertificateFor || []).includes(category)
-  ) {
-    escalationTriggers.push("smartphone_doa_claim");
-
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.requiresDOACertificate ||
-          "replacement_requires_doa_certificate",
-        allowed: false,
-        reason:
-          "Dead-on-arrival replacement requires brand/service-center DOA certificate and verification.",
-        requiresEscalation: true,
-        escalationTriggers,
-        nextAction: "collect_doa_certificate_and_unboxing_video",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  if (
-    (rules.replacement?.brandVerificationCategories || []).includes(category) &&
-    ["defective_product", "technical_issue"].includes(issueType)
-  ) {
-    escalationTriggers.push("brand_verification_required");
-
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.requiresBrandVerification ||
-          "replacement_requires_brand_verification",
-        allowed: false,
-        reason:
-          "This product category requires brand or service-center verification before replacement approval.",
-        requiresEscalation: true,
-        escalationTriggers,
-        nextAction: "collect_brand_verification_or_service_center_details",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  if (
-    ["damaged_product", "wrong_product", "missing_item"].includes(issueType)
-  ) {
-    escalationTriggers.push("unboxing_proof_required");
-
-    return applyCommonEscalation(
-      createResult({
-        intent: "replace_order",
-        order,
-        decision:
-          decisionCodes.requiresUnboxingProof ||
-          "replacement_requires_unboxing_proof",
-        allowed: false,
-        reason:
-          "Replacement claim requires clear unboxing proof or supporting evidence for verification.",
-        requiresEscalation: true,
-        escalationTriggers,
-        nextAction: "collect_unboxing_proof",
-        extra: {
-          issueType,
-        },
-      }),
-      order
-    );
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "replace_order",
-      order,
-      decision: decisionCodes.allowed || "replacement_allowed",
-      allowed: true,
-      reason:
-        "Product is eligible for replacement. Pickup and verification may be required.",
-      nextAction: "create_replacement_request",
-      extra: {
-        issueType,
+          "The order appears to be lost in transit and requires support review.",
       },
-    }),
-    order
-  );
-}
-
-// ===============================
-// REFUND STATUS
-// ===============================
-
-function evaluateRefund(order) {
-  const status = normalizeStatus(order.status);
-  const decisionCodes = rules.refund?.decisionCodes || {};
-  const refundTimeline = rules.refund?.standardTimelineBusinessDays || "3-7";
-
-  if (hasPaymentConflict(order)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "refund_status",
-        order,
-        decision:
-          decisionCodes.discrepancyEscalate || "refund_discrepancy_escalate",
-        allowed: false,
-        reason:
-          "Refund or payment discrepancy detected. This needs human support verification.",
-        requiresEscalation: true,
-        escalationTriggers: ["refund_dispute", "payment_conflict"],
-        nextAction: "create_payment_support_ticket",
-      }),
-      order
+      "lost_in_transit",
+      "HIGH"
     );
   }
 
-  if (status === "refund_completed") {
-    return createResult({
-      intent: "refund_status",
-      order,
-      decision: decisionCodes.completed || "refund_completed",
-      allowed: true,
-      reason: "Refund has already been completed.",
-      nextAction: "share_refund_reference_if_available",
-    });
-  }
-
-  if (status === "refund_initiated") {
-    return createResult({
-      intent: "refund_status",
-      order,
-      decision: decisionCodes.initiated || "refund_initiated",
-      allowed: true,
-      reason: `Refund has been initiated. Standard refund timeline is ${refundTimeline} business days.`,
-      nextAction: "wait_for_bank_processing",
-    });
-  }
-
-  if (status === "cancelled") {
-    if (isPrepaid(order) && isPaid(order)) {
-      return createResult({
-        intent: "refund_status",
-        order,
-        decision:
-          decisionCodes.initiated || "refund_pending_after_cancellation",
+  if (isDelayed(order)) {
+    return addEscalation(
+      {
+        ...result,
         allowed: true,
-        reason: `This order is cancelled. If the refund is not completed yet, it is normally processed within ${refundTimeline} business days to the original payment method.`,
-        refundRequired: true,
-        nextAction: "check_refund_processing_status",
-      });
-    }
-
-    return createResult({
-      intent: "refund_status",
-      order,
-      decision: "refund_not_applicable_cod_or_unpaid",
-      allowed: false,
-      reason:
-        "This order is cancelled, but no prepaid refund is applicable based on the current payment details.",
-      nextAction: "no_refund_action_required",
-    });
-  }
-
-  if (
-    [
-      "placed",
-      "confirmed",
-      "processing",
-      "dispatched",
-      "shipped",
-      "out_for_delivery",
-      "delivered",
-    ].includes(status)
-  ) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "refund_status",
-        order,
-        decision: "refund_not_started",
-        allowed: false,
+        decision: "tracking_delayed",
+        status: "DELAYED",
+        nextAction: "show_delay_status",
         reason:
-          "No active refund is found for this order yet. Refund can start after successful cancellation or after an approved return is picked up, received, and verified.",
-        refundRequired: false,
-        nextAction:
-          status === "delivered"
-            ? "check_return_or_replacement_if_eligible"
-            : "check_cancellation_or_return_status",
-      }),
-      order
-    );
-  }
-
-  if (status === "return_picked") {
-    return createResult({
-      intent: "refund_status",
-      order,
-      decision:
-        decisionCodes.pendingReturnReceived || "refund_pending_return_received",
-      allowed: false,
-      reason:
-        "Refund is pending because the returned product has not yet been received by the seller.",
-      nextAction: "wait_for_seller_to_receive_return",
-    });
-  }
-
-  if (status === "return_received" && order.qualityCheckPassed !== true) {
-    return createResult({
-      intent: "refund_status",
-      order,
-      decision:
-        decisionCodes.pendingQualityCheck || "refund_pending_quality_check",
-      allowed: false,
-      reason: "Refund is pending because quality check is not completed yet.",
-      nextAction: "wait_for_quality_check",
-    });
-  }
-
-  if (status === "quality_check_passed") {
-    const codNeedsBank = normalizePaymentMethod(order.paymentMethod) === "cod";
-
-    return createResult({
-      intent: "refund_status",
-      order,
-      decision: codNeedsBank
-        ? decisionCodes.pendingBankDetails || "refund_pending_bank_details"
-        : decisionCodes.initiated || "refund_initiated",
-      allowed: true,
-      reason: codNeedsBank
-        ? "Quality check is passed. Bank details are required to process COD refund."
-        : "Quality check is passed. Refund should be initiated to the original payment source.",
-      refundRequired: true,
-      nextAction: codNeedsBank ? "collect_bank_details" : "initiate_refund",
-    });
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "refund_status",
-      order,
-      decision: decisionCodes.pendingPickup || "refund_pending_pickup",
-      allowed: false,
-      reason:
-        "Refund can be processed only after cancellation or after return pickup and verification.",
-      nextAction: "check_cancellation_or_return_status",
-    }),
-    order
-  );
-}
-
-// ===============================
-// PAYMENT
-// ===============================
-
-function evaluatePayment(order) {
-  const paymentStatus = normalizePaymentStatus(order.paymentStatus);
-  const decisionCodes = rules.payment?.decisionCodes || {};
-
-  if (hasPaymentConflict(order)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "payment_issue",
-        order,
-        decision:
-          decisionCodes.paymentIssueEscalate || "payment_issue_escalate",
-        allowed: false,
-        reason:
-          "Payment conflict detected. This should be verified by the payments team.",
-        requiresEscalation: true,
-        escalationTriggers: ["payment_conflict"],
-        nextAction: "create_payment_support_ticket",
-      }),
-      order
-    );
-  }
-
-  if (paymentStatus === "paid") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "payment_issue",
-        order,
-        decision: "payment_successful",
-        allowed: true,
-        reason: "Payment is marked as successful for this order.",
-        nextAction: "no_payment_action_required",
-      }),
-      order
-    );
-  }
-
-  if (paymentStatus === "pending") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "payment_issue",
-        order,
-        decision: "payment_pending",
-        allowed: false,
-        reason:
-          "Payment is currently pending. Please wait for payment confirmation or bank update.",
-        nextAction: "wait_for_bank_processing",
-      }),
-      order
-    );
-  }
-
-  if (paymentStatus === "refunded") {
-    return createResult({
-      intent: "payment_issue",
-      order,
-      decision: "payment_refunded",
-      allowed: true,
-      reason: "Payment has already been refunded for this order.",
-      nextAction: "share_refund_reference_if_available",
-    });
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "payment_issue",
-      order,
-      decision: "payment_status_unclear",
-      allowed: false,
-      reason:
-        "Payment status is not clear enough for automatic resolution.",
-      requiresEscalation: true,
-      escalationTriggers: ["payment_conflict"],
-      nextAction: "create_payment_support_ticket",
-    }),
-    order
-  );
-}
-
-// ===============================
-// EXCHANGE
-// ===============================
-
-function evaluateExchange(order) {
-  const status = normalizeStatus(order.status);
-  const category = normalize(order.category);
-  const decisionCodes = rules.exchange?.decisionCodes || {};
-
-  if (status !== "delivered") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "exchange_order",
-        order,
-        decision: "exchange_blocked_not_delivered",
-        allowed: false,
-        reason:
-          "Exchange can be checked only after the order is delivered.",
-        nextAction: "wait_until_delivery",
-      }),
-      order
-    );
-  }
-
-  if (order.exchangeable === false) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "exchange_order",
-        order,
-        decision:
-          decisionCodes.blockedNonExchangeable ||
-          "exchange_blocked_non_exchangeable",
-        allowed: false,
-        reason: "This product is not exchangeable as per policy.",
-        nextAction: "offer_return_if_eligible",
-      }),
-      order
-    );
-  }
-
-  if (Number(order.exchangeCount || 0) >= 1) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "exchange_order",
-        order,
-        decision: "exchange_blocked_already_exchanged",
-        allowed: false,
-        reason:
-          "Only one exchange is allowed for this product, and exchange has already been used.",
-        nextAction: "human_review_if_customer_disputes",
-      }),
-      order
-    );
-  }
-
-  if (order.stockAvailableForExchange === false) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "exchange_order",
-        order,
-        decision:
-          decisionCodes.blockedStockUnavailable ||
-          "exchange_blocked_stock_unavailable",
-        allowed: false,
-        reason: "Exchange stock is currently not available.",
-        nextAction: "offer_return_if_eligible",
-      }),
-      order
-    );
-  }
-
-  if (order.addressServiceable === false) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "exchange_order",
-        order,
-        decision:
-          decisionCodes.blockedAddressNotServiceable ||
-          "exchange_blocked_address_not_serviceable",
-        allowed: false,
-        reason:
-          "Exchange pickup or delivery is not serviceable at this address.",
-        nextAction: "human_review_or_alternate_address",
-      }),
-      order
-    );
-  }
-
-  const windowDays =
-    order.exchangeWindowDays ||
-    rules.exchange?.categoryExchangeWindows?.[category] ||
-    rules.exchange?.defaultExchangeWindowDays ||
-    7;
-
-  if (!isInsideWindow(order.deliveryDaysAgo, windowDays)) {
-    return applyCommonEscalation(
-      createResult({
-        intent: "exchange_order",
-        order,
-        decision:
-          decisionCodes.blockedWindowExpired || "exchange_blocked_window_expired",
-        allowed: false,
-        reason: `Exchange window has expired. This product had an exchange window of ${windowDays} days.`,
-        nextAction: "check_return_or_human_review",
-      }),
-      order
-    );
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "exchange_order",
-      order,
-      decision: decisionCodes.allowed || "exchange_allowed",
-      allowed: true,
-      reason:
-        "Product is eligible for exchange. Pickup and quality check may be required.",
-      nextAction: "create_exchange_request",
-    }),
-    order
-  );
-}
-
-// ===============================
-// DELIVERY / TRACKING
-// ===============================
-
-function evaluateDelivery(order) {
-  const status = normalizeStatus(order.status);
-
-  const trackingId =
-    order.trackingId ||
-    order.awb ||
-    order.shipmentId ||
-    order.courierTrackingId ||
-    null;
-
-  const estimatedDeliveryDate =
-    order.estimatedDeliveryDate ||
-    order.expectedDeliveryDate ||
-    order.promisedDeliveryDate ||
-    null;
-
-  const deliveryDate = order.deliveryDate || order.deliveredAt || null;
-
-  if (status === "delivered") {
-    return createResult({
-      intent: "track_order",
-      order,
-      decision: "order_delivered",
-      allowed: true,
-      reason: deliveryDate
-        ? `Order has already been delivered on ${deliveryDate}.`
-        : "Order has already been delivered.",
-      nextAction: "show_delivered_status",
-      extra: {
-        trackingId,
-        deliveryDate,
-        currentStatus: "delivered",
+          "The shipment is delayed and should be monitored or reviewed.",
       },
-    });
+      "delivery_delay",
+      "MEDIUM"
+    );
   }
 
-  if (status === "out_for_delivery") {
-    return createResult({
-      intent: "track_order",
-      order,
-      decision: "order_out_for_delivery",
+  if (isOutForDelivery(order)) {
+    return {
+      ...result,
       allowed: true,
-      reason:
-        "Order is currently out for delivery and should reach the customer soon.",
+      decision: "tracking_out_for_delivery",
+      status: "OUT_FOR_DELIVERY",
       nextAction: "show_out_for_delivery_status",
-      extra: {
-        trackingId,
-        estimatedDeliveryDate,
-        currentStatus: "out_for_delivery",
-      },
-    });
-  }
-
-  if (status === "shipped" || status === "dispatched") {
-    return createResult({
-      intent: "track_order",
-      order,
-      decision:
-        rules.delivery?.decisionCodes?.trackingAvailable ||
-        "tracking_available",
-      allowed: true,
-      reason: estimatedDeliveryDate
-        ? `Order has been ${status}. Estimated delivery date is ${estimatedDeliveryDate}.`
-        : `Order has been ${status}. Tracking is available for this order.`,
-      nextAction: "share_tracking_details",
-      extra: {
-        trackingId,
-        estimatedDeliveryDate,
-        currentStatus: status,
-      },
-    });
-  }
-
-  if (
-    status === "placed" ||
-    status === "confirmed" ||
-    status === "processing"
-  ) {
-    return createResult({
-      intent: "track_order",
-      order,
-      decision: "order_not_dispatched_yet",
-      allowed: true,
-      reason: estimatedDeliveryDate
-        ? `Order is ${status} and has not been dispatched yet. Estimated delivery date is ${estimatedDeliveryDate}.`
-        : `Order is ${status} and has not been dispatched yet. Tracking usually becomes available after dispatch.`,
-      nextAction: "wait_until_dispatch",
-      extra: {
-        trackingId: null,
-        estimatedDeliveryDate,
-        currentStatus: status,
-      },
-    });
-  }
-
-  if (status === "cancelled") {
-    return createResult({
-      intent: "track_order",
-      order,
-      decision: "order_cancelled",
-      allowed: false,
       reason:
-        "This order has been cancelled, so delivery tracking is not available.",
-      nextAction: "check_refund_status_if_prepaid",
-      extra: {
-        currentStatus: "cancelled",
-      },
-    });
+        "The order is out for delivery.",
+    };
   }
 
-  if (status === "returned_to_origin") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "delivery_issue",
-        order,
-        decision: "returned_to_origin",
+  if (isDelivered(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "tracking_delivered",
+      status: "DELIVERED",
+      nextAction: "show_delivered_status",
+      reason:
+        "The order has been delivered.",
+    };
+  }
+
+  if (isShipped(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "tracking_shipped",
+      status: "SHIPPED",
+      nextAction: "show_tracking_status",
+      reason:
+        "The order has been shipped and is on the way.",
+    };
+  }
+
+  if (["placed", "confirmed", "processing", "packed", "ready_to_ship"].includes(status)) {
+    return {
+      ...result,
+      allowed: Boolean(trackingId),
+      decision: trackingId
+        ? "tracking_available_pre_dispatch"
+        : "tracking_not_available_pre_dispatch",
+      status: "NOT_DISPATCHED",
+      nextAction: trackingId
+        ? "show_tracking_status"
+        : "wait_for_dispatch",
+      reason: trackingId
+        ? "Tracking exists, but order has not fully moved into shipment stage."
+        : "Tracking usually becomes available after dispatch.",
+    };
+  }
+
+  return {
+    ...result,
+    allowed: Boolean(trackingId),
+    decision: trackingId
+      ? "tracking_available_unknown_status"
+      : "tracking_not_available",
+    status: status.toUpperCase(),
+    nextAction: trackingId ? "show_tracking_status" : "support_review_required",
+    reason: trackingId
+      ? "Tracking is available for this order."
+      : "Tracking is not available for this order status.",
+    requiresEscalation: !trackingId,
+    escalationTriggers: trackingId ? [] : ["tracking_unavailable_unknown_status"],
+  };
+}
+
+// =====================================================
+// CANCEL ORDER
+// =====================================================
+
+function evaluateCancellation(order, issueType = "cancellation") {
+  if (!order) return orderNotFound("cancel_order", issueType);
+
+  const result = buildBaseResult({
+    intent: "cancel_order",
+    order,
+    issueType,
+  });
+
+  if (isCancelled(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "already_cancelled",
+      status: "ALREADY_CANCELLED",
+      nextAction: "no_action_needed",
+      refundRequired: isPrepaid(order),
+      reason:
+        "The order is already cancelled.",
+    };
+  }
+
+  if (isDelivered(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "cancellation_not_allowed_delivered",
+      status: "DELIVERED",
+      nextAction: "offer_return_replacement_exchange",
+      refundRequired: false,
+      reason:
+        "Delivered orders cannot be cancelled. Return/replacement/exchange may be checked if eligible.",
+    };
+  }
+
+  if (isShipped(order) || isOutForDelivery(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "cancellation_not_allowed_shipped",
+      status: isOutForDelivery(order) ? "OUT_FOR_DELIVERY" : "SHIPPED",
+      nextAction: "offer_reject_delivery_or_post_delivery_options",
+      refundRequired: false,
+      reason:
+        "The order has already been shipped/out for delivery, so cancellation is not available at this stage.",
+    };
+  }
+
+  if (isLost(order) || isDelayed(order)) {
+    return addEscalation(
+      {
+        ...result,
         allowed: false,
+        decision: "cancellation_manual_review_required",
+        status: isLost(order) ? "LOST_IN_TRANSIT" : "DELAYED",
+        nextAction: "support_review_required",
+        refundRequired: isPrepaid(order),
         reason:
-          "This order is marked as returned to origin. Delivery could not be completed.",
-        requiresEscalation: true,
-        escalationTriggers: ["order_status_unclear"],
-        nextAction: "create_delivery_support_ticket",
-        extra: {
-          currentStatus: "returned_to_origin",
-        },
-      }),
-      order
-    );
-  }
-
-  if (status === "delivery_failed") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "delivery_issue",
-        order,
-        decision:
-          rules.delivery?.decisionCodes?.deliveryFailedEscalate ||
-          "delivery_failed_escalate",
-        allowed: false,
-        reason: "Delivery has failed and requires support review.",
-        requiresEscalation: true,
-        escalationTriggers: ["order_status_unclear"],
-        nextAction: "create_delivery_support_ticket",
-        extra: {
-          currentStatus: "delivery_failed",
-        },
-      }),
-      order
-    );
-  }
-
-  if (status === "lost_in_transit") {
-    return applyCommonEscalation(
-      createResult({
-        intent: "delivery_issue",
-        order,
-        decision:
-          rules.delivery?.decisionCodes?.lostInTransitEscalate ||
-          "lost_in_transit_escalate",
-        allowed: false,
-        reason: "Order appears to be lost in transit. This requires escalation.",
-        requiresEscalation: true,
-        escalationTriggers: ["order_status_unclear"],
-        nextAction: "create_delivery_support_ticket",
-        extra: {
-          currentStatus: "lost_in_transit",
-        },
-      }),
-      order
-    );
-  }
-
-  return applyCommonEscalation(
-    createResult({
-      intent: "track_order",
-      order,
-      decision:
-        rules.delivery?.decisionCodes?.trackingNotAvailable ||
-        "tracking_not_available",
-      allowed: false,
-      reason:
-        "Tracking status is not clear for this order. This may need support review.",
-      requiresEscalation: true,
-      escalationTriggers: ["order_status_unclear"],
-      nextAction: "human_review",
-      extra: {
-        currentStatus: status || "unknown",
+          "Cancellation needs support review because shipment status is abnormal.",
       },
-    }),
-    order
+      isLost(order) ? "lost_in_transit" : "delivery_delay",
+      "HIGH"
+    );
+  }
+
+  if (isCancellable(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "cancellation_confirmation_required",
+      status: "ELIGIBLE_FOR_CANCELLATION",
+      nextAction: "ask_cancellation_confirmation",
+      refundRequired: isPrepaid(order),
+      reason:
+        "The order has not been dispatched yet, so it is eligible for cancellation. Confirmation is required before action.",
+      policy:
+        "Sensitive actions should be confirmed by the customer before execution.",
+    };
+  }
+
+  return addEscalation(
+    {
+      ...result,
+      allowed: false,
+      decision: "cancellation_status_manual_review",
+      status: "MANUAL_REVIEW_REQUIRED",
+      nextAction: "support_review_required",
+      refundRequired: isPrepaid(order),
+      reason:
+        "Cancellation eligibility is unclear for the current order status.",
+    },
+    "unclear_cancellation_status",
+    "MEDIUM"
   );
 }
 
-// ===============================
-// MAIN RULE ROUTER
-// Supports both:
-// applyRules({ intent, order, issueType })
-// applyRules(intent, order, issueType)
-// ===============================
+// =====================================================
+// RETURN ORDER
+// =====================================================
 
-function applyRules(input, maybeOrder = null, maybeIssueType = "general") {
-  let intent;
-  let order;
-  let issueType;
+function evaluateReturn(order, issueType = "return") {
+  if (!order) return orderNotFound("return_order", issueType);
 
-  if (typeof input === "object" && input !== null) {
-    intent = input.intent;
-    order = input.order;
-    issueType = input.issueType || "general";
-  } else {
-    intent = input;
-    order = maybeOrder;
-    issueType = maybeIssueType || "general";
-  }
+  const result = buildBaseResult({
+    intent: "return_order",
+    order,
+    issueType,
+  });
 
-  intent = normalize(intent);
+  const returnable = toBool(order.returnable, true);
+  const daysAgo = getDeliveryDaysAgo(order);
+  const withinWindow = isWithinWindow(daysAgo, order.returnWindowDays || RETURN_WINDOW_DAYS);
 
-  if (!intent) {
-    return createResult({
-      intent: null,
-      order: null,
-      decision: rules.commonErrors?.unsupportedIntent || "unsupported_intent",
+  if (isCancelled(order)) {
+    return {
+      ...result,
       allowed: false,
-      reason: "Intent is missing or unsupported.",
-      nextAction: "ask_clarifying_question",
-    });
+      decision: "return_not_allowed_cancelled",
+      status: "CANCELLED",
+      nextAction: "no_return_for_cancelled_order",
+      reason:
+        "Cancelled orders cannot be returned.",
+    };
   }
 
-  switch (intent) {
-    case "greeting":
-      return evaluateGreeting();
+  if (!isDelivered(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "return_not_allowed_before_delivery",
+      status: "NOT_DELIVERED",
+      nextAction: "wait_until_delivered",
+      reason:
+        "Return can be requested only after the order is delivered.",
+    };
+  }
 
-    case "non_commerce_request":
-      return evaluateNonCommerceRequest();
+  if (!returnable) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "return_not_allowed_policy",
+      status: "NOT_RETURNABLE",
+      nextAction: "offer_replacement_or_support_if_applicable",
+      reason:
+        "This item is not returnable as per policy.",
+    };
+  }
 
-    case "unsafe_request":
-      return evaluateUnsafeRequest();
+  if (!withinWindow) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "return_window_expired",
+      status: "RETURN_WINDOW_EXPIRED",
+      nextAction: "support_review_if_exception",
+      reason:
+        "The return window has expired.",
+    };
+  }
 
-    case "human_support":
-      return evaluateHumanSupport(order);
+  return {
+    ...result,
+    allowed: true,
+    decision: "return_eligible",
+    status: "RETURN_ELIGIBLE",
+    nextAction: "create_return_request_after_confirmation",
+    refundRequired: true,
+    reason:
+      "The order is delivered, returnable, and within the return window.",
+  };
+}
 
-    case "delivery_policy":
-    case "refund_policy":
-    case "return_policy":
-    case "replacement_policy":
-    case "cancellation_policy":
-      return evaluatePolicyInfo(intent);
+// =====================================================
+// REPLACEMENT ORDER
+// =====================================================
 
-    case "order_reference_only":
-      return createResult({
-        intent,
-        order,
-        decision: "order_reference_only_needs_context",
+function evaluateReplacement(order, issueType = "replacement") {
+  if (!order) return orderNotFound("replace_order", issueType);
+
+  const result = buildBaseResult({
+    intent: "replace_order",
+    order,
+    issueType,
+  });
+
+  const replacementEligible = toBool(
+    order.replacementEligible ?? order.replaceable,
+    true
+  );
+
+  const daysAgo = getDeliveryDaysAgo(order);
+  const withinWindow = isWithinWindow(
+    daysAgo,
+    order.replacementWindowDays || REPLACEMENT_WINDOW_DAYS
+  );
+
+  if (isCancelled(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "replacement_not_allowed_cancelled",
+      status: "CANCELLED",
+      nextAction: "no_replacement_for_cancelled_order",
+      reason:
+        "Cancelled orders cannot be replaced.",
+    };
+  }
+
+  if (!isDelivered(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "replacement_not_allowed_before_delivery",
+      status: "NOT_DELIVERED",
+      nextAction: "wait_until_delivered",
+      reason:
+        "Replacement can be requested only after the order is delivered.",
+    };
+  }
+
+  if (!replacementEligible) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "replacement_not_allowed_policy",
+      status: "NOT_REPLACEMENT_ELIGIBLE",
+      nextAction: "offer_return_or_support_if_applicable",
+      reason:
+        "This item is not eligible for replacement as per policy.",
+    };
+  }
+
+  if (!withinWindow) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "replacement_window_expired",
+      status: "REPLACEMENT_WINDOW_EXPIRED",
+      nextAction: "support_review_if_exception",
+      reason:
+        "The replacement window has expired.",
+    };
+  }
+
+  return {
+    ...result,
+    allowed: true,
+    decision: "replacement_eligible",
+    status: "REPLACEMENT_ELIGIBLE",
+    nextAction: "create_replacement_request_after_confirmation",
+    reason:
+      "The order is delivered and eligible for replacement.",
+  };
+}
+
+// =====================================================
+// EXCHANGE ORDER
+// =====================================================
+
+function evaluateExchange(order, issueType = "exchange") {
+  if (!order) return orderNotFound("exchange_order", issueType);
+
+  const result = buildBaseResult({
+    intent: "exchange_order",
+    order,
+    issueType,
+  });
+
+  const exchangeable = toBool(order.exchangeable, true);
+  const daysAgo = getDeliveryDaysAgo(order);
+  const withinWindow = isWithinWindow(
+    daysAgo,
+    order.exchangeWindowDays || EXCHANGE_WINDOW_DAYS
+  );
+
+  if (isCancelled(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "exchange_not_allowed_cancelled",
+      status: "CANCELLED",
+      nextAction: "no_exchange_for_cancelled_order",
+      reason:
+        "Cancelled orders cannot be exchanged.",
+    };
+  }
+
+  if (!isDelivered(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "exchange_not_allowed_before_delivery",
+      status: "NOT_DELIVERED",
+      nextAction: "wait_until_delivered",
+      reason:
+        "Exchange can be requested only after the order is delivered.",
+    };
+  }
+
+  if (!exchangeable) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "exchange_not_allowed_policy",
+      status: "NOT_EXCHANGEABLE",
+      nextAction: "offer_return_or_replacement_if_applicable",
+      reason:
+        "This item is not exchangeable as per policy.",
+    };
+  }
+
+  if (!withinWindow) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "exchange_window_expired",
+      status: "EXCHANGE_WINDOW_EXPIRED",
+      nextAction: "support_review_if_exception",
+      reason:
+        "The exchange window has expired.",
+    };
+  }
+
+  return {
+    ...result,
+    allowed: true,
+    decision: "exchange_eligible",
+    status: "EXCHANGE_ELIGIBLE",
+    nextAction: "create_exchange_request_after_confirmation",
+    reason:
+      "The order is delivered and eligible for exchange.",
+  };
+}
+
+// =====================================================
+// REORDER
+// =====================================================
+
+function evaluateReorder(order, issueType = "reorder") {
+  if (!order) return orderNotFound("reorder_order", issueType);
+
+  const result = buildBaseResult({
+    intent: "reorder_order",
+    order,
+    issueType,
+  });
+
+  if (isDelivered(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "reorder_allowed_delivered",
+      status: "REORDER_GUIDANCE",
+      nextAction: "guide_reorder_from_order_history",
+      reason:
+        "The order has already been delivered, so the customer can place the same product again if it is still available.",
+    };
+  }
+
+  if (isCancelled(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "reorder_allowed_cancelled",
+      status: "REORDER_GUIDANCE",
+      nextAction: "guide_fresh_order",
+      reason:
+        "The order was cancelled, so the customer may place a fresh order for the same product if available.",
+    };
+  }
+
+  if (isReturnedOrRefunded(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "reorder_allowed_returned_refunded",
+      status: "REORDER_GUIDANCE",
+      nextAction: "guide_fresh_order",
+      reason:
+        "The previous order was returned/refunded, so the customer can place a fresh order if the product is available.",
+    };
+  }
+
+  if (isOutForDelivery(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "reorder_not_needed_out_for_delivery",
+      status: "ACTIVE_ORDER",
+      nextAction: "offer_tracking_or_fresh_quantity",
+      reason:
+        "The current order is out for delivery, so reorder is not needed unless the customer wants another quantity.",
+    };
+  }
+
+  if (isShipped(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "reorder_not_needed_shipped",
+      status: "ACTIVE_ORDER",
+      nextAction: "offer_tracking_or_fresh_quantity",
+      reason:
+        "The current order is shipped and still on the way, so reorder is not needed for the same order yet.",
+    };
+  }
+
+  if (isActiveNotDelivered(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: "reorder_not_needed_active_order",
+      status: "ACTIVE_ORDER",
+      nextAction: "offer_status_or_cancel_if_eligible",
+      reason:
+        "The current order is still active and not completed yet.",
+    };
+  }
+
+  return {
+    ...result,
+    allowed: true,
+    decision: "reorder_general_guidance",
+    status: "REORDER_GUIDANCE",
+    nextAction: "guide_fresh_order",
+    reason:
+      "The customer can place a fresh order if the product is still available.",
+  };
+}
+
+// =====================================================
+// REFUND
+// =====================================================
+
+function evaluateRefund(order, issueType = "refund") {
+  if (!order) return orderNotFound("refund_status", issueType);
+
+  const result = buildBaseResult({
+    intent: "refund_status",
+    order,
+    issueType,
+  });
+
+  const paymentStatus = getPaymentStatus(order);
+  const refundStatus = normalizeText(order.refundStatus || "");
+
+  if (isCancelled(order) && isPrepaid(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "refund_expected_after_cancellation",
+      status: "REFUND_PROCESSING_OR_EXPECTED",
+      nextAction: "show_refund_timeline",
+      refundRequired: true,
+      reason:
+        "The order is cancelled and appears prepaid, so refund processing should follow the payment timeline.",
+    };
+  }
+
+  if (isReturnedOrRefunded(order)) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "refund_completed_or_returned",
+      status: refundStatus === "refunded" ? "REFUNDED" : "RETURNED_OR_REFUNDED",
+      nextAction: "show_refund_status",
+      refundRequired: false,
+      reason:
+        "The order is already returned/refunded.",
+    };
+  }
+
+  if (refundStatus) {
+    return {
+      ...result,
+      allowed: true,
+      decision: "refund_status_available",
+      status: refundStatus.toUpperCase(),
+      nextAction: "show_refund_status",
+      refundRequired: !["refunded", "completed"].includes(refundStatus),
+      reason:
+        "Refund status is available for this order.",
+    };
+  }
+
+  if (["failed", "pending", "initiated"].includes(paymentStatus)) {
+    return addEscalation(
+      {
+        ...result,
         allowed: false,
+        decision: "refund_payment_review_required",
+        status: "PAYMENT_REVIEW_REQUIRED",
+        nextAction: "support_review_required",
+        refundRequired: true,
         reason:
-          "Only an order ID was provided. Please tell me whether you want to track, cancel, return, replace, exchange, or check refund/payment status.",
-        nextAction: "ask_customer_intent",
-      });
-
-    default:
-      break;
+          "Payment/refund state needs support review.",
+      },
+      "payment_review_required",
+      "HIGH"
+    );
   }
 
-  if (!order) {
-    return createResult({
-      intent,
-      order: null,
-      decision: rules.commonErrors?.orderNotFound || "order_not_found",
+  return {
+    ...result,
+    allowed: false,
+    decision: "refund_not_applicable_yet",
+    status: "REFUND_NOT_APPLICABLE_YET",
+    nextAction: "explain_refund_conditions",
+    refundRequired: false,
+    reason:
+      "Refund is usually applicable after cancellation, return, or payment failure confirmation.",
+  };
+}
+
+// =====================================================
+// PAYMENT ISSUE
+// =====================================================
+
+function evaluatePaymentIssue(order, issueType = "payment") {
+  if (!order) return orderNotFound("payment_issue", issueType);
+
+  const result = buildBaseResult({
+    intent: "payment_issue",
+    order,
+    issueType,
+  });
+
+  return addEscalation(
+    {
+      ...result,
       allowed: false,
-      reason: "Order was not found. Please check the order ID.",
-      nextAction: "ask_valid_order_id",
-    });
+      decision: "payment_issue_support_review",
+      status: "PAYMENT_REVIEW_REQUIRED",
+      nextAction: "support_review_required",
+      refundRequired: true,
+      reason:
+        "Payment issues such as double charge or money deducted require support/payment team review.",
+    },
+    "payment_issue",
+    "HIGH"
+  );
+}
+
+// =====================================================
+// DELIVERY ISSUE
+// =====================================================
+
+function evaluateDeliveryIssue(order, issueType = "delivery") {
+  if (!order) return orderNotFound("delivery_issue", issueType);
+
+  const status = getStatus(order);
+  const base = buildBaseResult({
+    intent: "delivery_issue",
+    order,
+    issueType,
+  });
+
+  if (isLost(order)) {
+    return addEscalation(
+      {
+        ...base,
+        allowed: false,
+        decision: "delivery_lost_in_transit",
+        status: "LOST_IN_TRANSIT",
+        nextAction: "support_review_required",
+        reason:
+          "The order appears to be lost in transit and needs support intervention.",
+      },
+      "lost_in_transit",
+      "HIGH"
+    );
   }
+
+  if (isDelayed(order)) {
+    return addEscalation(
+      {
+        ...base,
+        allowed: true,
+        decision: "delivery_delayed",
+        status: "DELAYED",
+        nextAction: "show_delay_and_support_option",
+        reason:
+          "The order is delayed and can be reviewed by support if needed.",
+      },
+      "delivery_delay",
+      "MEDIUM"
+    );
+  }
+
+  if (isOutForDelivery(order)) {
+    return {
+      ...base,
+      allowed: true,
+      decision: "delivery_out_for_delivery",
+      status: "OUT_FOR_DELIVERY",
+      nextAction: "show_out_for_delivery_status",
+      reason:
+        "The order is currently out for delivery.",
+    };
+  }
+
+  if (isDelivered(order)) {
+    return {
+      ...base,
+      allowed: true,
+      decision: "delivery_delivered",
+      status: "DELIVERED",
+      nextAction: "confirm_delivery_or_raise_issue",
+      reason:
+        "The order is marked delivered.",
+    };
+  }
+
+  return {
+    ...base,
+    allowed: true,
+    decision: "delivery_status_available",
+    status: status.toUpperCase(),
+    nextAction: "show_delivery_status",
+    reason:
+      "Delivery status is available for this order.",
+  };
+}
+
+// =====================================================
+// ITEM ISSUES
+// =====================================================
+
+function evaluateItemIssue(order, intent, issueType) {
+  if (!order) return orderNotFound(intent, issueType);
+
+  const result = buildBaseResult({
+    intent,
+    order,
+    issueType,
+  });
+
+  if (!isDelivered(order)) {
+    return {
+      ...result,
+      allowed: false,
+      decision: `${issueType}_not_allowed_before_delivery`,
+      status: "NOT_DELIVERED",
+      nextAction: "wait_until_delivered_or_support_review",
+      reason:
+        "Item issues are usually raised after delivery. If the package is missing or delivery is incorrect, support can review it.",
+      requiresEscalation: issueType === "missing_item",
+      escalationTriggers:
+        issueType === "missing_item" ? ["missing_item_before_delivery"] : [],
+    };
+  }
+
+  return addEscalation(
+    {
+      ...result,
+      allowed: true,
+      decision: `${issueType}_support_review`,
+      status: "SUPPORT_REVIEW_REQUIRED",
+      nextAction: "support_review_required",
+      reason:
+        "This item issue should be reviewed by the support team.",
+    },
+    issueType,
+    "MEDIUM"
+  );
+}
+
+// =====================================================
+// MAIN ENTRY
+// =====================================================
+
+function applyRules(input = {}) {
+  const intent = input.intent || input.intentResult?.intent || "general_support";
+  const order = input.order || null;
+  const issueType =
+    input.issueType ||
+    input.intentResult?.issueType ||
+    "general";
 
   switch (intent) {
+    case "track_order":
+      return evaluateTracking(order, issueType);
+
     case "cancel_order":
-      return evaluateCancellation(order);
+      return evaluateCancellation(order, issueType);
 
     case "return_order":
-      return evaluateReturn(order);
+      return evaluateReturn(order, issueType);
 
     case "replace_order":
       return evaluateReplacement(order, issueType);
 
-    case "damaged_item":
-      return evaluateReplacement(order, "damaged_product");
+    case "exchange_order":
+      return evaluateExchange(order, issueType);
 
-    case "wrong_item":
-      return evaluateReplacement(order, "wrong_product");
-
-    case "missing_item":
-      return evaluateReplacement(order, "missing_item");
+    case "reorder_order":
+      return evaluateReorder(order, issueType);
 
     case "refund_status":
-      return evaluateRefund(order);
-
-    case "exchange_order":
-      return evaluateExchange(order);
+      return evaluateRefund(order, issueType);
 
     case "payment_issue":
-      return evaluatePayment(order);
+      return evaluatePaymentIssue(order, issueType);
 
-    case "track_order":
-    case "order_status":
     case "delivery_issue":
-      return evaluateDelivery(order);
+      return evaluateDeliveryIssue(order, issueType);
+
+    case "missing_item":
+      return evaluateItemIssue(order, "missing_item", "missing_item");
+
+    case "wrong_item":
+      return evaluateItemIssue(order, "wrong_item", "wrong_item");
+
+    case "damaged_item":
+      return evaluateItemIssue(order, "damaged_item", "damaged_item");
 
     default:
-      return createResult({
+      return {
         intent,
+        issueType,
         order,
-        decision: rules.commonErrors?.unsupportedIntent || "unsupported_intent",
+        orderId: getOrderId(order),
+        trackingId: getTrackingId(order),
+        orderStatus: order ? getStatus(order) : null,
+        displayStatus: order ? getDisplayStatus(order) : null,
+
         allowed: false,
+        decision: "unsupported_intent",
+        status: "UNSUPPORTED_INTENT",
+
+        refundRequired: false,
+        requiresEscalation: false,
+        escalationTriggers: [],
+
+        nextAction: "ask_clarification",
         reason:
-          "This support intent is not supported by the current rule engine.",
-        nextAction: "fallback_llm_or_human_review",
-      });
+          "This intent is not handled by the rule engine.",
+        policy: null,
+      };
   }
+}
+
+// =====================================================
+// COMPATIBILITY ALIASES
+// =====================================================
+
+function applyBusinessRules(input = {}) {
+  return applyRules(input);
+}
+
+function runRuleEngine(input = {}) {
+  return applyRules(input);
+}
+
+function evaluateRules(input = {}) {
+  return applyRules(input);
 }
 
 module.exports = {
   applyRules,
-  _internal: {
-    normalize,
-    normalizeStatus,
-    normalizePaymentStatus,
-    normalizePaymentMethod,
-    getOrderValue,
-    isPrepaid,
-    isPaid,
-    hasPaymentConflict,
-    isHighValue,
-    isVeryHighValue,
-    isInsideWindow,
-    createResult,
-    shouldApplyValueEscalation,
-    applyCommonEscalation,
-    evaluatePolicyInfo,
-    evaluateNonCommerceRequest,
-    evaluateGreeting,
-    evaluateUnsafeRequest,
-    evaluateHumanSupport,
-    evaluateCancellation,
-    evaluateReturn,
-    resolveReplacementIssueType,
-    evaluateReplacement,
-    evaluateRefund,
-    evaluatePayment,
-    evaluateExchange,
-    evaluateDelivery,
-  },
+  applyBusinessRules,
+  runRuleEngine,
+  evaluateRules,
+
+  evaluateTracking,
+  evaluateCancellation,
+  evaluateReturn,
+  evaluateReplacement,
+  evaluateExchange,
+  evaluateReorder,
+  evaluateRefund,
+  evaluatePaymentIssue,
+  evaluateDeliveryIssue,
+
+  normalizeText,
+  getStatus,
+  getDisplayStatus,
+  getOrderId,
+  getTrackingId,
 };
