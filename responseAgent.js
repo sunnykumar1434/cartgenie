@@ -10,7 +10,8 @@
  * - Status-aware tracking responses.
  * - Reorder should never sound like cancel/return.
  * - Cancellation eligibility asks confirmation, not fake execution.
- * - Demo-safe wording for sensitive actions.
+ * - Return / replacement / exchange eligibility asks confirmation.
+ * - Refund/payment concern can be raised for support review after confirmation.
  * - Softer, more user-friendly tone.
  */
 
@@ -91,7 +92,7 @@ function orderNotFoundMessage(ruleResult = {}) {
   const orderId = getOrderId(ruleResult);
 
   if (orderId) {
-    return `I’m sorry, I could not find order ${orderId} in the demo records. Please check the order ID once and share it again.`;
+    return `I’m sorry, I could not find order ${orderId} in our records. Please check the order ID once and share it again.`;
   }
 
   return "I’m sorry, I could not find a valid order ID in your message. Please share an order ID like ORD101 so I can check it for you.";
@@ -181,6 +182,7 @@ function trackingResponse(ruleResult = {}) {
 
   if (decision === "tracking_delayed") {
     const trackText = trackingId ? ` Tracking ID: ${trackingId}.` : "";
+
     return buildResponse({
       status: "DELAYED",
       message: `I checked order ${orderId}. Current status: ${status}.${trackText} The shipment looks delayed, so I’ll keep this marked for support review if the delay continues.${appendTrackingDetails(
@@ -195,6 +197,7 @@ function trackingResponse(ruleResult = {}) {
 
   if (decision === "tracking_out_for_delivery") {
     const trackText = trackingId ? ` Tracking ID: ${trackingId}.` : "";
+
     return buildResponse({
       status: "OUT_FOR_DELIVERY",
       message: `I checked order ${orderId}. Current status: Out For Delivery.${trackText} Your order should be delivered soon, usually by the end of the delivery day.${appendTrackingDetails(
@@ -206,6 +209,7 @@ function trackingResponse(ruleResult = {}) {
 
   if (decision === "tracking_delivered") {
     const trackText = trackingId ? ` Tracking ID: ${trackingId}.` : "";
+
     return buildResponse({
       status: "DELIVERED",
       message: `I checked order ${orderId}. Current status: Delivered.${trackText} If you have any issue with the product, I can help check return, replacement, or exchange eligibility.`,
@@ -215,6 +219,7 @@ function trackingResponse(ruleResult = {}) {
 
   if (decision === "tracking_shipped") {
     const trackText = trackingId ? ` Tracking ID: ${trackingId}.` : "";
+
     return buildResponse({
       status: "SHIPPED",
       message: `I checked order ${orderId}. Current status: Shipped.${trackText} Your order is on the way.${appendTrackingDetails(
@@ -226,6 +231,7 @@ function trackingResponse(ruleResult = {}) {
 
   if (decision === "tracking_available_pre_dispatch") {
     const trackText = trackingId ? ` Tracking ID: ${trackingId}.` : "";
+
     return buildResponse({
       status: "PROCESSING",
       message: `I checked order ${orderId}. Current status: ${status}.${trackText} The order has not fully moved into shipment yet, so courier updates may appear after dispatch.${appendTrackingDetails(
@@ -298,7 +304,11 @@ function cancellationResponse(ruleResult = {}) {
     return buildResponse({
       status: "NOT_ALLOWED",
       message: `I understand you want to cancel this order. I checked order ${orderId}, and it has already been ${status.toLowerCase()}, so cancellation is not available at this stage. You may reject the delivery if that option is available. After delivery, I can also help check return, replacement, or exchange eligibility.`,
-      suggestedActions: ["Track order", "Check return eligibility", "Check replacement eligibility"],
+      suggestedActions: [
+        "Track order",
+        "Check return eligibility",
+        "Check replacement eligibility",
+      ],
     });
   }
 
@@ -394,9 +404,13 @@ function returnResponse(ruleResult = {}) {
 
   if (decision === "return_eligible") {
     return buildResponse({
-      status: "ELIGIBLE",
-      message: `I checked order ${orderId}. This order looks eligible for return. In a real integrated system, I would ask for confirmation and then create a return request.`,
-      suggestedActions: ["Confirm return request", "Ask return policy"],
+      status: "CONFIRMATION_REQUIRED",
+      message: `I checked order ${orderId}. This order is eligible for return. Would you like me to create the return request now?`,
+      suggestedActions: ["Yes, create return request", "No, not now"],
+      metadata: {
+        pendingAction: "confirm_return_order",
+        orderId,
+      },
     });
   }
 
@@ -456,9 +470,13 @@ function replacementResponse(ruleResult = {}) {
 
   if (decision === "replacement_eligible") {
     return buildResponse({
-      status: "ELIGIBLE",
-      message: `I checked order ${orderId}. This order looks eligible for replacement. In a real integrated system, I would ask for confirmation and then create a replacement request.`,
-      suggestedActions: ["Confirm replacement request"],
+      status: "CONFIRMATION_REQUIRED",
+      message: `I checked order ${orderId}. This order is eligible for replacement. Would you like me to create the replacement request now?`,
+      suggestedActions: ["Yes, create replacement request", "No, not now"],
+      metadata: {
+        pendingAction: "confirm_replace_order",
+        orderId,
+      },
     });
   }
 
@@ -518,9 +536,13 @@ function exchangeResponse(ruleResult = {}) {
 
   if (decision === "exchange_eligible") {
     return buildResponse({
-      status: "ELIGIBLE",
-      message: `I checked order ${orderId}. This order looks eligible for exchange. In a real integrated system, I would ask for confirmation and then create an exchange request.`,
-      suggestedActions: ["Confirm exchange request"],
+      status: "CONFIRMATION_REQUIRED",
+      message: `I checked order ${orderId}. This order is eligible for exchange. Would you like me to create the exchange request now?`,
+      suggestedActions: ["Yes, create exchange request", "No, not now"],
+      metadata: {
+        pendingAction: "confirm_exchange_order",
+        orderId,
+      },
     });
   }
 
@@ -629,42 +651,59 @@ function refundResponse(ruleResult = {}) {
   if (decision === "refund_completed_or_returned") {
     return buildResponse({
       status: "REFUND_STATUS",
-      message: `I checked order ${orderId}. Current status: ${status}. The order is already in a returned/refunded stage. If you have not received the refund, I can mark it for support/payment review.`,
-      suggestedActions: ["Payment support review"],
+      message: `I checked order ${orderId}. Current status: ${status}. The order is already in a returned/refunded stage. If you have not received the refund, I can raise this for payment support review.`,
+      suggestedActions: ["Raise refund concern", "Check again later"],
+      metadata: {
+        pendingAction: "confirm_refund_support",
+        orderId,
+      },
     });
   }
 
   if (decision === "refund_status_available") {
     return buildResponse({
       status: "REFUND_STATUS",
-      message: `I checked order ${orderId}. Refund status: ${status}. If this does not match your bank/payment statement, I can mark it for support review.`,
-      suggestedActions: ["Payment support review"],
+      message: `I checked order ${orderId}. Refund status: ${status}. If this does not match your bank/payment statement, I can raise this for payment support review.`,
+      suggestedActions: ["Raise refund concern", "Check again later"],
+      metadata: {
+        pendingAction: "confirm_refund_support",
+        orderId,
+      },
     });
   }
 
   if (decision === "refund_payment_review_required") {
     return buildResponse({
-      status: "ESCALATION_REQUIRED",
-      message: `I checked order ${orderId}. The refund/payment state needs support review. I’ll mark this for the payment support team to check carefully.`,
-      suggestedActions: ["Payment support review"],
+      status: "CONFIRMATION_REQUIRED",
+      message: `I checked order ${orderId}. The refund/payment state needs support review. Would you like me to raise this concern with the payment support team?`,
+      suggestedActions: ["Yes, raise refund concern", "No, not now"],
       metadata: {
-        requiresEscalation: true,
+        pendingAction: "confirm_refund_support",
+        orderId,
       },
     });
   }
 
   if (decision === "refund_not_applicable_yet") {
     return buildResponse({
-      status: "NOT_APPLICABLE_YET",
-      message: `I checked order ${orderId}. A refund is usually applicable after cancellation, return, or payment failure confirmation. Right now, I don’t see a clear refund trigger for this order. If you believe money was deducted or refund is pending, I can mark it for support review.`,
-      suggestedActions: ["Payment support review", "Check cancellation/return"],
+      status: "CONFIRMATION_REQUIRED",
+      message: `I checked order ${orderId}. A refund is usually applicable after cancellation, return, or payment failure confirmation. Right now, I don’t see a clear refund trigger for this order. If you believe money was deducted or refund is pending, would you like me to raise this for support review?`,
+      suggestedActions: ["Yes, raise refund concern", "No, not now"],
+      metadata: {
+        pendingAction: "confirm_refund_support",
+        orderId,
+      },
     });
   }
 
   return buildResponse({
-    status: "INFO",
-    message: `I checked order ${orderId}. I could not clearly confirm refund status, so I can mark this for payment support review if needed.`,
-    suggestedActions: ["Payment support review"],
+    status: "CONFIRMATION_REQUIRED",
+    message: `I checked order ${orderId}. I could not clearly confirm refund status. Would you like me to raise this for payment support review?`,
+    suggestedActions: ["Yes, raise refund concern", "No, not now"],
+    metadata: {
+      pendingAction: "confirm_refund_support",
+      orderId,
+    },
   });
 }
 

@@ -22,6 +22,7 @@ const INTENTS = {
   CONTEXT_RESET: "context_reset",
 
   GENERAL_SUPPORT: "general_support",
+  GENERAL_POLICY_QUERY: "general_policy_query",
   OFF_TOPIC: "off_topic",
 
   ORDER_REFERENCE_ONLY: "order_reference_only",
@@ -177,15 +178,12 @@ function normalizeTrackingId(value = "") {
 function extractOrderId(text = "") {
   const raw = String(text || "");
 
-  // ORD102, ORD-102, ORD 102
   let match = raw.match(/\bORD\s*-?\s*(\d+)\b/i);
   if (match) return `ORD${match[1]}`.toUpperCase();
 
-  // ODR typo
   match = raw.match(/\bODR\s*-?\s*(\d+)\b/i);
   if (match) return `ORD${match[1]}`.toUpperCase();
 
-  // order id 102, order number 102, order 102
   match = raw.match(
     /\border\s*(?:id|number|no|#)?\s*(?:is|:|=)?\s*-?\s*(\d+)\b/i
   );
@@ -197,7 +195,6 @@ function extractOrderId(text = "") {
 function extractTrackingId(text = "") {
   const raw = String(text || "");
 
-  // TRK102, TRK-102, TRK 102, AWB102
   const match = raw.match(/\b(TRK|AWB)\s*-?\s*(\d+)\b/i);
   if (match) return `${match[1].toUpperCase()}${match[2]}`;
 
@@ -517,7 +514,6 @@ function isRudeUser(text = "") {
     "stop talking"
   ]);
 }
-
 function isCustomerFrustration(text = "") {
   const q = normalizeForMatching(text);
 
@@ -817,11 +813,376 @@ function isDamagedItemIntent(text = "") {
 }
 
 // =====================================================
+// GENERAL POLICY / FAQ DETECTION
+// =====================================================
+
+function scoreKeywords(text = "", keywords = []) {
+  const q = normalizeForMatching(text);
+
+  return keywords.reduce((score, keyword) => {
+    const k = normalizeForMatching(keyword);
+    if (!k) return score;
+    if (q === k) return score + 3;
+    if (q.includes(k)) return score + 2;
+
+    const words = k.split(" ").filter(Boolean);
+    if (words.length === 1 && new RegExp(`\\b${words[0]}\\b`).test(q)) {
+      return score + 1;
+    }
+
+    return score;
+  }, 0);
+}
+
+function hasPolicyQuestionShape(text = "") {
+  const q = normalizeForMatching(text);
+
+  if (!q) return false;
+
+  if (
+    /^(can|could|should|would|will|do|does|did|is|are|am|was|were|what|when|where|why|how)\b/.test(
+      q
+    )
+  ) {
+    return true;
+  }
+
+  return includesAny(q, [
+    "policy",
+    "allowed",
+    "possible",
+    "eligible",
+    "eligibility",
+    "how long",
+    "how many days",
+    "time limit",
+    "window",
+    "fee",
+    "charge",
+    "penalty",
+    "documents",
+    "document",
+    "proof",
+    "packaging",
+    "opened product",
+    "after shipping",
+    "after delivery",
+    "before delivery",
+    "without",
+    "timeline",
+    "process",
+    "procedure",
+    "steps",
+    "what if",
+    "need to",
+    "required"
+  ]);
+}
+
+function detectPolicyTopic(text = "") {
+  const topicScores = [
+    {
+      topic: INTENTS.CANCEL_ORDER,
+      issueType: "cancellation",
+      score: scoreKeywords(text, [
+        "cancel",
+        "cancellation",
+        "cancelled",
+        "canceled",
+        "after shipping",
+        "before shipping"
+      ])
+    },
+    {
+      topic: INTENTS.RETURN_ORDER,
+      issueType: "return",
+      score: scoreKeywords(text, [
+        "return",
+        "return policy",
+        "return window",
+        "opened product",
+        "packaging",
+        "pickup",
+        "send back"
+      ])
+    },
+    {
+      topic: INTENTS.REPLACE_ORDER,
+      issueType: "replacement",
+      score: scoreKeywords(text, [
+        "replace",
+        "replacement",
+        "defective",
+        "not working",
+        "damaged product",
+        "broken product"
+      ])
+    },
+    {
+      topic: INTENTS.EXCHANGE_ORDER,
+      issueType: "exchange",
+      score: scoreKeywords(text, [
+        "exchange",
+        "size change",
+        "change size",
+        "color change",
+        "change color",
+        "different size"
+      ])
+    },
+    {
+      topic: INTENTS.REFUND_STATUS,
+      issueType: "refund",
+      score: scoreKeywords(text, [
+        "refund",
+        "money back",
+        "refund timeline",
+        "refund pending",
+        "bank"
+      ])
+    },
+    {
+      topic: INTENTS.DELIVERY_ISSUE,
+      issueType: "delivery",
+      score: scoreKeywords(text, [
+        "delivery",
+        "delivered",
+        "shipping",
+        "shipped",
+        "courier",
+        "delivery agent",
+        "address",
+        "delay",
+        "late",
+        "lost",
+        "package",
+        "parcel"
+      ])
+    },
+    {
+      topic: INTENTS.TRACK_ORDER,
+      issueType: "tracking",
+      score: scoreKeywords(text, [
+        "track",
+        "tracking",
+        "tracking id",
+        "shipment status",
+        "delivery status",
+        "latest status"
+      ])
+    },
+    {
+      topic: INTENTS.PAYMENT_ISSUE,
+      issueType: "payment",
+      score: scoreKeywords(text, [
+        "payment",
+        "paid",
+        "charged",
+        "deducted",
+        "debited",
+        "transaction",
+        "upi",
+        "card"
+      ])
+    },
+    {
+      topic: INTENTS.ORDER_ID_HELP,
+      issueType: "order_id_help",
+      score: scoreKeywords(text, [
+        "order id",
+        "order number",
+        "order no",
+        "what does an order id look like"
+      ])
+    }
+  ];
+
+  const best = topicScores.sort((a, b) => b.score - a.score)[0];
+
+  if (!best || best.score <= 0) return null;
+
+  return best;
+}
+function detectPolicyCondition(text = "", topic = "") {
+  const q = normalizeForMatching(text);
+
+  if (
+    includesAny(q, [
+      "after shipping",
+      "already shipped",
+      "once shipped",
+      "after dispatch",
+      "dispatched"
+    ])
+  ) {
+    return "after_shipping";
+  }
+
+  if (
+    includesAny(q, [
+      "before delivery",
+      "not delivered",
+      "not received yet",
+      "before receiving"
+    ])
+  ) {
+    return "before_delivery";
+  }
+
+  if (includesAny(q, ["after delivery", "after delivered", "delivered"])) {
+    return "after_delivery";
+  }
+
+  if (
+    includesAny(q, [
+      "opened",
+      "open product",
+      "opened product",
+      "used product"
+    ])
+  ) {
+    return "opened_product";
+  }
+
+  if (
+    includesAny(q, [
+      "without packaging",
+      "original packaging",
+      "box",
+      "package missing",
+      "packaging"
+    ])
+  ) {
+    return "packaging";
+  }
+
+  if (
+    includesAny(q, [
+      "how many days",
+      "how long",
+      "return window",
+      "time limit",
+      "window"
+    ])
+  ) {
+    if (topic === INTENTS.REFUND_STATUS) return "refund_timeline";
+    return "time_window";
+  }
+
+  if (
+    includesAny(q, [
+      "document",
+      "documents",
+      "proof",
+      "photo",
+      "video",
+      "invoice"
+    ])
+  ) {
+    return "documents_required";
+  }
+
+  if (includesAny(q, ["fee", "charge", "penalty", "cost"])) {
+    return "fee";
+  }
+
+  if (
+    includesAny(q, [
+      "delivery agent",
+      "courier contact",
+      "contact courier",
+      "delivery boy",
+      "delivery partner"
+    ])
+  ) {
+    return "delivery_contact";
+  }
+
+  if (
+    includesAny(q, [
+      "change delivery date",
+      "reschedule",
+      "delivery date",
+      "change address",
+      "address correct",
+      "address"
+    ])
+  ) {
+    return "delivery_change";
+  }
+
+  if (
+    includesAny(q, [
+      "delayed",
+      "delay",
+      "late",
+      "lost",
+      "frozen",
+      "no movement"
+    ])
+  ) {
+    return "delivery_delay";
+  }
+
+  if (
+    includesAny(q, [
+      "refund pending",
+      "not received refund",
+      "where is my refund",
+      "when will i get refund"
+    ])
+  ) {
+    return "refund_pending";
+  }
+
+  if (includesAny(q, ["look like", "format", "example"])) {
+    return "format_example";
+  }
+
+  if (includesAny(q, ["policy", "allowed", "eligible", "eligibility"])) {
+    return "policy";
+  }
+
+  return "general";
+}
+
+function detectGeneralPolicyQuery(text = "") {
+  if (hasExplicitOrderId(text) || hasExplicitTrackingId(text)) return null;
+
+  const q = normalizeForMatching(text);
+  const topic = detectPolicyTopic(q);
+
+  if (!topic) return null;
+
+  const hasQuestionShape = hasPolicyQuestionShape(q);
+
+  const directActionOnly =
+    /^(cancel|return|replace|exchange|refund|track|reorder)(\s+(it|order|my order|this order))?$/.test(
+      q
+    ) ||
+    /^i want to (cancel|return|replace|exchange|refund|track|reorder)\b/.test(
+      q
+    ) ||
+    /^please (cancel|return|replace|exchange|refund|track|reorder)\b/.test(q);
+
+  if (directActionOnly && !hasQuestionShape) return null;
+  if (!hasQuestionShape) return null;
+
+  return {
+    policyTopic: topic.topic,
+    policyCondition: detectPolicyCondition(q, topic.topic),
+    issueType: topic.issueType
+  };
+}
+
+// =====================================================
 // ISSUE TYPE DETECTION
 // =====================================================
 
 function detectIssueType(intent, text = "") {
   const q = normalizeForMatching(text);
+
+  if (intent === INTENTS.GENERAL_POLICY_QUERY) return "general_policy";
 
   if (intent === INTENTS.PAYMENT_ISSUE) {
     if (includesAny(q, ["charged twice", "double charged"])) {
@@ -840,29 +1201,27 @@ function detectIssueType(intent, text = "") {
       return "payment_deducted_order_not_created";
     }
 
-    if (includesAny(q, ["payment failed", "transaction failed"])) {
-      return "payment_failed";
-    }
-
     return "payment";
   }
 
-  if (intent === INTENTS.REFUND_STATUS) return "refund";
+  if (intent === INTENTS.DELIVERY_ISSUE) {
+    if (includesAny(q, ["lost", "lost in transit"])) return "lost_in_transit";
+    if (includesAny(q, ["delayed", "delay", "late"])) return "delivery_delay";
+    if (includesAny(q, ["not delivered"])) return "not_delivered";
+    return "delivery";
+  }
+
+  if (intent === INTENTS.MISSING_ITEM) return "missing_item";
+  if (intent === INTENTS.WRONG_ITEM) return "wrong_item";
+  if (intent === INTENTS.DAMAGED_ITEM) return "damaged_item";
+
+  if (intent === INTENTS.CANCEL_ORDER) return "cancellation";
   if (intent === INTENTS.RETURN_ORDER) return "return";
   if (intent === INTENTS.REPLACE_ORDER) return "replacement";
   if (intent === INTENTS.EXCHANGE_ORDER) return "exchange";
   if (intent === INTENTS.REORDER_ORDER) return "reorder";
-  if (intent === INTENTS.CANCEL_ORDER) return "cancellation";
+  if (intent === INTENTS.REFUND_STATUS) return "refund";
   if (intent === INTENTS.TRACK_ORDER) return "tracking";
-  if (intent === INTENTS.DELIVERY_ISSUE) return "delivery";
-  if (intent === INTENTS.MISSING_ITEM) return "missing_item";
-  if (intent === INTENTS.WRONG_ITEM) return "wrong_item";
-  if (intent === INTENTS.DAMAGED_ITEM) return "damaged_item";
-  if (intent === INTENTS.HUMAN_SUPPORT) return "human_support";
-  if (intent === INTENTS.UNSAFE_REQUEST) return "security";
-  if (intent === INTENTS.OFF_TOPIC) return "off_topic";
-  if (intent === INTENTS.CONTEXT_COMPLAINT) return "context_complaint";
-  if (intent === INTENTS.TONE_FEEDBACK) return "tone_feedback";
 
   return "general";
 }
@@ -871,388 +1230,191 @@ function detectIssueType(intent, text = "") {
 // MAIN DETECTOR
 // =====================================================
 
-function detectIntentAndEntities(userQuery = "") {
-  const rawText = String(userQuery || "");
-  const clean = normalizeForMatching(rawText);
+function detectIntentAndEntities(text = "", context = {}) {
+  const rawText = String(text || "");
+  const q = normalizeForMatching(rawText);
 
   const orderId = extractOrderId(rawText);
   const trackingId = extractTrackingId(rawText);
 
-  if (isEmptyOrTooShort(rawText)) {
+  if (isEmptyOrTooShort(q)) {
     return makeResult({
       intent: INTENTS.GENERAL_SUPPORT,
-      confidence: 0.55,
-      orderId,
-      trackingId,
-      issueType: "general",
+      confidence: 0.35,
       rawText,
-      source: "deterministic_empty_or_short"
+      source: "empty_or_too_short"
     });
   }
 
-  // Safety/meta first
-  if (isUnsafeRequest(rawText)) {
-    return makeResult({
-      intent: INTENTS.UNSAFE_REQUEST,
-      confidence: 0.98,
-      orderId,
-      trackingId,
-      issueType: "security",
-      rawText,
-      source: "deterministic_safety",
-      metadata: {
-        riskSignals: ["unsafe_request"]
-      }
-    });
-  }
-
-  if (isContextReset(rawText)) {
-    return makeResult({
-      intent: INTENTS.CONTEXT_RESET,
-      confidence: 0.98,
-      orderId: null,
-      trackingId: null,
-      issueType: "general",
-      rawText,
-      source: "deterministic_context_reset"
-    });
-  }
-
-  if (isConversationEnd(rawText)) {
-    return makeResult({
-      intent: INTENTS.CONVERSATION_END,
-      confidence: 0.98,
-      orderId: null,
-      trackingId: null,
-      issueType: "general",
-      rawText,
-      source: "deterministic_conversation_end"
-    });
-  }
-
-  if (isGreeting(rawText)) {
+  if (isGreeting(q)) {
     return makeResult({
       intent: INTENTS.GREETING,
-      confidence: 0.97,
-      orderId: null,
-      trackingId: null,
-      issueType: "general",
+      confidence: 0.98,
       rawText,
       source: "deterministic_greeting"
     });
   }
 
-  if (isOrderIdHelp(rawText)) {
+  if (isConversationEnd(q)) {
+    return makeResult({
+      intent: INTENTS.CONVERSATION_END,
+      confidence: 0.98,
+      rawText,
+      source: "deterministic_conversation_end"
+    });
+  }
+
+  if (isContextReset(q)) {
+    return makeResult({
+      intent: INTENTS.CONTEXT_RESET,
+      confidence: 0.98,
+      rawText,
+      source: "deterministic_context_reset"
+    });
+  }
+
+  if (isUnsafeRequest(q)) {
+    return makeResult({
+      intent: INTENTS.UNSAFE_REQUEST,
+      confidence: 0.98,
+      rawText,
+      source: "deterministic_unsafe_request",
+      metadata: {
+        requiresEscalation: true,
+        riskSignals: ["unsafe_request"]
+      }
+    });
+  }
+
+  if (isOrderIdHelp(q)) {
     return makeResult({
       intent: INTENTS.ORDER_ID_HELP,
-      confidence: 0.97,
-      orderId: null,
-      trackingId: null,
-      issueType: "order_id_help",
+      confidence: 0.95,
       rawText,
-      source: "deterministic_order_id_help"
+      source: "deterministic_order_id_help",
+      issueType: "order_id_help"
     });
   }
 
-  if (isNegativeCorrection(rawText)) {
-    return makeResult({
-      intent: INTENTS.NEGATIVE_CORRECTION,
-      confidence: 0.96,
-      orderId,
-      trackingId,
-      issueType: "negative_correction",
-      rawText,
-      source: "deterministic_negative_correction"
-    });
-  }
-
-  if (isHumanSupport(rawText)) {
+  if (isHumanSupport(q)) {
     return makeResult({
       intent: INTENTS.HUMAN_SUPPORT,
-      confidence: 0.97,
+      confidence: 0.92,
       orderId,
       trackingId,
       issueType: "human_support",
       rawText,
       source: "deterministic_human_support",
       metadata: {
+        requiresEscalation: true,
         riskSignals: ["customer_requested_human_support"]
       }
     });
   }
 
-  if (isContextComplaint(rawText)) {
+  if (isNegativeCorrection(q)) {
     return makeResult({
-      intent: INTENTS.CONTEXT_COMPLAINT,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "context_complaint",
+      intent: INTENTS.NEGATIVE_CORRECTION,
+      confidence: 0.9,
       rawText,
-      source: "deterministic_context_complaint",
-      metadata: {
-        riskSignals: ["context_complaint"]
-      }
+      source: "deterministic_negative_correction"
     });
   }
 
-  if (isToneFeedback(rawText)) {
+  if (isToneFeedback(q)) {
     return makeResult({
       intent: INTENTS.TONE_FEEDBACK,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "tone_feedback",
+      confidence: 0.9,
       rawText,
-      source: "deterministic_tone_feedback",
-      metadata: {
-        riskSignals: ["tone_feedback"]
-      }
+      source: "deterministic_tone_feedback"
     });
   }
 
-  if (isAbusiveUser(rawText)) {
+  if (isContextComplaint(q)) {
     return makeResult({
-      intent: INTENTS.ABUSIVE_USER,
-      confidence: 0.95,
-      orderId,
-      trackingId,
-      issueType: "customer_frustration",
+      intent: INTENTS.CONTEXT_COMPLAINT,
+      confidence: 0.9,
       rawText,
-      source: "deterministic_abusive_user",
-      metadata: {
-        riskSignals: ["abusive_language", "angry_customer"]
-      }
+      source: "deterministic_context_complaint"
     });
   }
 
-  if (isRudeUser(rawText)) {
-    return makeResult({
-      intent: INTENTS.RUDE_USER,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "customer_frustration",
-      rawText,
-      source: "deterministic_rude_user",
-      metadata: {
-        riskSignals: ["rude_customer", "angry_customer"]
-      }
-    });
-  }
-
-  if (isCustomerFrustration(rawText)) {
-    return makeResult({
-      intent: INTENTS.CUSTOMER_FRUSTRATION,
-      confidence: 0.93,
-      orderId,
-      trackingId,
-      issueType: "customer_frustration",
-      rawText,
-      source: "deterministic_customer_frustration",
-      metadata: {
-        riskSignals: ["angry_customer"]
-      }
-    });
-  }
-
-  if (isTrustQuestion(rawText)) {
+  if (isTrustQuestion(q)) {
     return makeResult({
       intent: INTENTS.TRUST_QUESTION,
       confidence: 0.9,
-      orderId,
-      trackingId,
-      issueType: "general",
       rawText,
       source: "deterministic_trust_question"
     });
   }
 
-  if (isOffTopic(rawText)) {
+  if (isAbusiveUser(q)) {
+    return makeResult({
+      intent: INTENTS.ABUSIVE_USER,
+      confidence: 0.92,
+      rawText,
+      source: "deterministic_abusive_user",
+      metadata: {
+        requiresEscalation: true,
+        riskSignals: ["angry_customer"]
+      }
+    });
+  }
+
+  if (isRudeUser(q)) {
+    return makeResult({
+      intent: INTENTS.RUDE_USER,
+      confidence: 0.9,
+      rawText,
+      source: "deterministic_rude_user"
+    });
+  }
+
+  if (isCustomerFrustration(q)) {
+    return makeResult({
+      intent: INTENTS.CUSTOMER_FRUSTRATION,
+      confidence: 0.88,
+      rawText,
+      source: "deterministic_customer_frustration",
+      metadata: {
+        requiresEscalation: true,
+        riskSignals: ["angry_customer"]
+      }
+    });
+  }
+
+  if (isOffTopic(q)) {
     return makeResult({
       intent: INTENTS.OFF_TOPIC,
       confidence: 0.9,
-      orderId: null,
-      trackingId: null,
-      issueType: "off_topic",
       rawText,
       source: "deterministic_off_topic"
     });
   }
 
-  // Tracking ID alone always means tracking/status.
-  if (trackingId && !orderId) {
+  const generalPolicy = detectGeneralPolicyQuery(rawText);
+
+  if (generalPolicy) {
     return makeResult({
-      intent: INTENTS.TRACK_ORDER,
-      confidence: 0.98,
+      intent: INTENTS.GENERAL_POLICY_QUERY,
+      confidence: 0.88,
       orderId: null,
-      trackingId,
-      issueType: "tracking",
+      trackingId: null,
+      issueType: generalPolicy.issueType,
       rawText,
-      source: "deterministic_tracking_id"
-    });
-  }
-
-  // IMPORTANT: Reorder before cancel/return/replace.
-  if (isReorderIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.REORDER_ORDER,
-      confidence: 0.96,
-      orderId,
-      trackingId,
-      issueType: "reorder",
-      rawText,
-      source: "deterministic_reorder"
-    });
-  }
-
-  // Payment issue before refund because "charged/deducted" should not become refund.
-  if (isPaymentIssueIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.PAYMENT_ISSUE,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: detectIssueType(INTENTS.PAYMENT_ISSUE, rawText),
-      rawText,
-      source: "deterministic_payment_issue",
+      source: "deterministic_general_policy",
       metadata: {
-        riskSignals: ["payment_issue"]
+        isGeneralPolicyQuestion: true,
+        policyTopic: generalPolicy.policyTopic,
+        policyCondition: generalPolicy.policyCondition
       }
     });
   }
 
-  if (isRefundIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.REFUND_STATUS,
-      confidence: 0.93,
-      orderId,
-      trackingId,
-      issueType: "refund",
-      rawText,
-      source: "deterministic_refund"
-    });
-  }
-
-  if (isMissingItemIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.MISSING_ITEM,
-      confidence: 0.93,
-      orderId,
-      trackingId,
-      issueType: "missing_item",
-      rawText,
-      source: "deterministic_missing_item"
-    });
-  }
-
-  if (isWrongItemIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.WRONG_ITEM,
-      confidence: 0.93,
-      orderId,
-      trackingId,
-      issueType: "wrong_item",
-      rawText,
-      source: "deterministic_wrong_item"
-    });
-  }
-
-  if (isDamagedItemIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.DAMAGED_ITEM,
-      confidence: 0.93,
-      orderId,
-      trackingId,
-      issueType: "damaged_item",
-      rawText,
-      source: "deterministic_damaged_item"
-    });
-  }
-
-  if (isCancelIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.CANCEL_ORDER,
-      confidence: 0.95,
-      orderId,
-      trackingId,
-      issueType: "cancellation",
-      rawText,
-      source: "deterministic_cancel"
-    });
-  }
-
-  if (isExchangeIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.EXCHANGE_ORDER,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "exchange",
-      rawText,
-      source: "deterministic_exchange"
-    });
-  }
-
-  if (isReplacementIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.REPLACE_ORDER,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "replacement",
-      rawText,
-      source: "deterministic_replacement"
-    });
-  }
-
-  if (isReturnIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.RETURN_ORDER,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "return",
-      rawText,
-      source: "deterministic_return"
-    });
-  }
-
-  // Delivery issues before generic tracking, but status queries should remain track_order.
-  if (isDeliveryIssueIntent(rawText) && !isTrackingStatusIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.DELIVERY_ISSUE,
-      confidence: 0.9,
-      orderId,
-      trackingId,
-      issueType: "delivery",
-      rawText,
-      source: "deterministic_delivery_issue",
-      metadata: {
-        riskSignals: includesAny(clean, ["lost", "lost in transit"])
-          ? ["lost_in_transit"]
-          : []
-      }
-    });
-  }
-
-  if (isTrackingStatusIntent(rawText)) {
-    return makeResult({
-      intent: INTENTS.TRACK_ORDER,
-      confidence: 0.94,
-      orderId,
-      trackingId,
-      issueType: "tracking",
-      rawText,
-      source: "deterministic_tracking_status"
-    });
-  }
-
-  // Only order ID present.
-  if (orderId) {
+  if (orderId && !isCancelIntent(q) && !isReturnIntent(q) && !isReplacementIntent(q) && !isExchangeIntent(q) && !isReorderIntent(q) && !isRefundIntent(q) && !isPaymentIssueIntent(q) && !isTrackingStatusIntent(q) && !isDeliveryIssueIntent(q) && !isMissingItemIntent(q) && !isWrongItemIntent(q) && !isDamagedItemIntent(q)) {
     return makeResult({
       intent: INTENTS.ORDER_REFERENCE_ONLY,
-      confidence: 0.88,
+      confidence: 0.9,
       orderId,
       trackingId,
       issueType: "general",
@@ -1260,28 +1422,171 @@ function detectIntentAndEntities(userQuery = "") {
       source: "deterministic_order_reference_only"
     });
   }
+    if (isReorderIntent(q)) {
+    return makeResult({
+      intent: INTENTS.REORDER_ORDER,
+      confidence: 0.92,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.REORDER_ORDER, q),
+      rawText,
+      source: "deterministic_reorder"
+    });
+  }
+
+  if (isRefundIntent(q)) {
+    return makeResult({
+      intent: INTENTS.REFUND_STATUS,
+      confidence: 0.92,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.REFUND_STATUS, q),
+      rawText,
+      source: "deterministic_refund"
+    });
+  }
+
+  if (isPaymentIssueIntent(q)) {
+    return makeResult({
+      intent: INTENTS.PAYMENT_ISSUE,
+      confidence: 0.9,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.PAYMENT_ISSUE, q),
+      rawText,
+      source: "deterministic_payment_issue"
+    });
+  }
+
+  if (isMissingItemIntent(q)) {
+    return makeResult({
+      intent: INTENTS.MISSING_ITEM,
+      confidence: 0.9,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.MISSING_ITEM, q),
+      rawText,
+      source: "deterministic_missing_item"
+    });
+  }
+
+  if (isWrongItemIntent(q)) {
+    return makeResult({
+      intent: INTENTS.WRONG_ITEM,
+      confidence: 0.9,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.WRONG_ITEM, q),
+      rawText,
+      source: "deterministic_wrong_item"
+    });
+  }
+
+  if (isDamagedItemIntent(q)) {
+    return makeResult({
+      intent: INTENTS.DAMAGED_ITEM,
+      confidence: 0.9,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.DAMAGED_ITEM, q),
+      rawText,
+      source: "deterministic_damaged_item"
+    });
+  }
+
+  if (isCancelIntent(q)) {
+    return makeResult({
+      intent: INTENTS.CANCEL_ORDER,
+      confidence: 0.94,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.CANCEL_ORDER, q),
+      rawText,
+      source: "deterministic_cancel"
+    });
+  }
+
+  if (isReturnIntent(q)) {
+    return makeResult({
+      intent: INTENTS.RETURN_ORDER,
+      confidence: 0.94,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.RETURN_ORDER, q),
+      rawText,
+      source: "deterministic_return"
+    });
+  }
+
+  if (isReplacementIntent(q)) {
+    return makeResult({
+      intent: INTENTS.REPLACE_ORDER,
+      confidence: 0.92,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.REPLACE_ORDER, q),
+      rawText,
+      source: "deterministic_replacement"
+    });
+  }
+
+  if (isExchangeIntent(q)) {
+    return makeResult({
+      intent: INTENTS.EXCHANGE_ORDER,
+      confidence: 0.92,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.EXCHANGE_ORDER, q),
+      rawText,
+      source: "deterministic_exchange"
+    });
+  }
+
+  if (isDeliveryIssueIntent(q)) {
+    return makeResult({
+      intent: INTENTS.DELIVERY_ISSUE,
+      confidence: 0.9,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.DELIVERY_ISSUE, q),
+      rawText,
+      source: "deterministic_delivery_issue"
+    });
+  }
+
+  if (isTrackingStatusIntent(q)) {
+    return makeResult({
+      intent: INTENTS.TRACK_ORDER,
+      confidence: 0.92,
+      orderId,
+      trackingId,
+      issueType: detectIssueType(INTENTS.TRACK_ORDER, q),
+      rawText,
+      source: "deterministic_tracking"
+    });
+  }
+
+  if (trackingId) {
+    return makeResult({
+      intent: INTENTS.TRACK_ORDER,
+      confidence: 0.9,
+      orderId,
+      trackingId,
+      issueType: "tracking",
+      rawText,
+      source: "deterministic_tracking_reference"
+    });
+  }
 
   return makeResult({
     intent: INTENTS.GENERAL_SUPPORT,
-    confidence: 0.65,
+    confidence: 0.55,
     orderId,
     trackingId,
     issueType: "general",
     rawText,
-    source: "deterministic_general_support"
+    source: "default_general_support"
   });
-}
-
-// =====================================================
-// COMPATIBILITY ALIASES
-// =====================================================
-
-function detectIntent(userQuery = "") {
-  return detectIntentAndEntities(userQuery);
-}
-
-function classifyIntent(userQuery = "") {
-  return detectIntentAndEntities(userQuery);
 }
 
 // =====================================================
@@ -1293,18 +1598,20 @@ module.exports = {
   ORDER_REQUIRED_INTENTS,
 
   detectIntentAndEntities,
-  detectIntent,
-  classifyIntent,
 
   normalizeText,
   normalizeForMatching,
   includesAny,
-  clampConfidence,
+  matchesAny,
 
   extractOrderId,
   extractTrackingId,
   normalizeOrderId,
   normalizeTrackingId,
+  hasExplicitOrderId,
+  hasExplicitTrackingId,
+
+  detectIssueType,
 
   isGreeting,
   isConversationEnd,
@@ -1312,22 +1619,30 @@ module.exports = {
   isOrderIdHelp,
   isHumanSupport,
   isNegativeCorrection,
+  isUnsafeRequest,
+  isTrustQuestion,
+  isToneFeedback,
+  isContextComplaint,
+  isAbusiveUser,
+  isRudeUser,
+  isCustomerFrustration,
+  isOffTopic,
 
   isReorderIntent,
-  isTrackingStatusIntent,
   isCancelIntent,
   isReturnIntent,
   isReplacementIntent,
   isExchangeIntent,
   isRefundIntent,
   isPaymentIssueIntent,
+  isTrackingStatusIntent,
+  isDeliveryIssueIntent,
+  isMissingItemIntent,
+  isWrongItemIntent,
+  isDamagedItemIntent,
 
-  isCustomerFrustration,
-  isAbusiveUser,
-  isRudeUser,
-  isToneFeedback,
-  isTrustQuestion,
-  isContextComplaint,
-  isUnsafeRequest,
-  isOffTopic
+  detectGeneralPolicyQuery,
+  detectPolicyTopic,
+  detectPolicyCondition,
+  hasPolicyQuestionShape
 };
